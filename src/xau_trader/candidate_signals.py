@@ -6,7 +6,9 @@ events.  It deliberately stops at a paper decision.  It has no broker, order,
 fill, account, sizing, stop, target, or P&L behavior.
 
 One decision is emitted for every sealed M15 lifecycle transition.  BUY and
-SELL are proposed only for that completed bar's next open (the bar end).  A
+SELL are proposed only for that completed bar's immediate next open (the bar
+end).  A scheduled closure cancels the proposal rather than queuing an entry
+for reopening.  The finite calendar's end is an explicit unknown-open gate.  A
 NO_TRADE decision has ``proposed_entry_at=None``.  Evidence that was not
 available by the next-open deadline can never turn that historical decision
 into an action.
@@ -36,6 +38,13 @@ from .market_regime import (
     StructureLeg,
 )
 from .multitimeframe import H1_DURATION, M15_DURATION, H1PivotEvent, PivotKind
+from .session_calendar import SessionCalendarArtifact
+from .session_timing import (
+    SESSION_STRATEGY_SEMANTICS,
+    next_open_start,
+    open_bar_count,
+    validate_calendar,
+)
 from .supply_demand import ImpulseDirection, OriginSelectionPolicy, ZoneEvent, ZoneKind
 from .zone_lifecycle import (
     EqualTimeOrder,
@@ -93,6 +102,8 @@ class CandidateReason(str, Enum):
     TOUCH_BAR_CONFIRMATION_EXCLUDED = "touch_bar_confirmation_excluded"
     CONFIRMATION_WINDOW_EXPIRED = "confirmation_window_expired"
     ZONE_INVALID_AT_M15_STEP = "zone_invalid_at_m15_step"
+    SCHEDULED_CLOSURE_NEXT_OPEN = "scheduled_closure_next_open"
+    CALENDAR_COVERAGE_EXHAUSTED = "calendar_coverage_exhausted"
 
 
 DecisionKey = Tuple[str, datetime, datetime, datetime]
@@ -102,7 +113,8 @@ DecisionKey = Tuple[str, datetime, datetime, datetime]
 class CandidatePolicy:
     """Required choices and exact formation provenance for one experiment.
 
-    There are intentionally no defaults.  A candidate run accepts zones from
+    Semantic choices have no defaults; an optional calendar enables the
+    separately fingerprinted session semantics.  A candidate run accepts zones from
     exactly one impulse-policy fingerprint and one origin-policy configuration;
     a mixed or unexpected formation stream is rejected rather than filtered.
     """
@@ -113,8 +125,10 @@ class CandidatePolicy:
     entry_timing: EntryTiming
     regime_alignment: RegimeAlignment
     retest_validity: RetestValidity
+    calendar: Optional[SessionCalendarArtifact] = None
 
     def __post_init__(self) -> None:
+        validate_calendar(self.calendar)
         _validate_fingerprint(
             self.expected_impulse_policy_fingerprint,
             "expected_impulse_policy_fingerprint",
@@ -136,7 +150,7 @@ class CandidatePolicy:
 
     @property
     def canonical_identity(self) -> str:
-        return ";".join(
+        identity = ";".join(
             (
                 "paper-candidate-policy-v1",
                 "expected_impulse_policy_fingerprint={}".format(
@@ -153,6 +167,11 @@ class CandidatePolicy:
                 "retest_validity={}".format(self.retest_validity.value),
             )
         )
+        if self.calendar is not None:
+            identity += ";calendar={};session_semantics={}".format(
+                self.calendar.fingerprint, SESSION_STRATEGY_SEMANTICS
+            )
+        return identity
 
     @property
     def fingerprint(self) -> str:
@@ -181,8 +200,10 @@ class CandidateDecision:
     lifecycle_policy_fingerprint: str
     regime_policy_fingerprint: str
     confirmation_policy_fingerprint: str
+    calendar: Optional[SessionCalendarArtifact] = None
 
     def __post_init__(self) -> None:
+        validate_calendar(self.calendar)
         _require_enum(self.action, CandidateAction, "action")
         if not isinstance(self.reasons, tuple) or not self.reasons:
             raise ValueError("decision reasons must be a non-empty tuple")
@@ -191,8 +212,26 @@ class CandidateDecision:
         if len(set(self.reasons)) != len(self.reasons):
             raise ValueError("decision reasons must be unique")
         _validate_m15_interval(self.m15_bar_start, self.m15_bar_end, "decision bar")
-        if self.next_m15_open != self.m15_bar_end:
-            raise ValueError("next_m15_open must equal the completed M15 bar end")
+        expected_next = self.m15_bar_end
+        if self.calendar is not None:
+            self.calendar.validate_bar(self.m15_bar_start, self.m15_bar_end)
+            expected_next = next_open_start(self.calendar, self.m15_bar_end)
+        if self.next_m15_open != expected_next:
+            raise ValueError("next_m15_open conflicts with the exact next open")
+        closure_reason = _next_open_failure(self.calendar, self.m15_bar_end)
+        if closure_reason is not None and (
+            self.action != CandidateAction.NO_TRADE
+            or self.reasons != (closure_reason,)
+        ):
+            raise ValueError("a closing or uncovered next open requires explicit NO_TRADE")
+        if closure_reason is None and any(
+            reason in (
+                CandidateReason.SCHEDULED_CLOSURE_NEXT_OPEN,
+                CandidateReason.CALENDAR_COVERAGE_EXHAUSTED,
+            )
+            for reason in self.reasons
+        ):
+            raise ValueError("next-open closure reason conflicts with the calendar")
         for value, name in (
             (self.available_at, "available_at"),
             (self.transition_available_at, "transition_available_at"),
@@ -288,6 +327,8 @@ def _validate_m15_interval(start: datetime, end: datetime, label: str) -> None:
 def _validate_zone_provenance(zone: ZoneEvent, policy: CandidatePolicy) -> None:
     if not isinstance(zone, ZoneEvent):
         raise TypeError("zone state must contain a ZoneEvent")
+    if zone.calendar != policy.calendar:
+        raise CandidateDataError("zone calendar is mixed or unexpected")
     fingerprint = zone.impulse_key[0] if len(zone.impulse_key) == 4 else None
     if fingerprint != policy.expected_impulse_policy_fingerprint:
         raise CandidateDataError(
@@ -307,9 +348,13 @@ def _validate_lifecycle(
     lifecycle_policy = lifecycle.book.policy
     if not isinstance(lifecycle_policy, ZoneLifecyclePolicy):
         raise TypeError("lifecycle book must bind a ZoneLifecyclePolicy")
+    if lifecycle_policy.calendar != policy.calendar:
+        raise CandidateDataError("lifecycle calendar conflicts with candidate policy")
     if lifecycle.book.policy_fingerprint != lifecycle_policy.fingerprint:
         raise CandidateDataError("lifecycle book policy fingerprint conflicts")
     for transition in lifecycle.transitions:
+        if transition.calendar != policy.calendar:
+            raise CandidateDataError("transition calendar conflicts with candidate policy")
         if transition.policy_fingerprint != lifecycle_policy.fingerprint:
             raise CandidateDataError("transition policy fingerprint conflicts")
         for state in transition.states_before + transition.states_after:
@@ -327,7 +372,11 @@ def _validate_lifecycle(
     return lifecycle.transitions
 
 
-def _validate_pivot(pivot: H1PivotEvent, expected_kind: PivotKind) -> None:
+def _validate_pivot(
+    pivot: H1PivotEvent,
+    expected_kind: PivotKind,
+    calendar: Optional[SessionCalendarArtifact] = None,
+) -> None:
     if not isinstance(pivot, H1PivotEvent):
         raise TypeError("regime evidence must contain H1PivotEvent values")
     if pivot.kind != expected_kind:
@@ -338,7 +387,20 @@ def _validate_pivot(pivot: H1PivotEvent, expected_kind: PivotKind) -> None:
     available = _require_utc(pivot.available_at, "pivot available_at")
     if end - start != H1_DURATION or start.minute or start.second or start.microsecond:
         raise CandidateDataError("regime pivot must identify one aligned H1 bar")
-    if confirmed != end + 3 * H1_DURATION:
+    if (
+        type(pivot.left_wing) is not int
+        or type(pivot.right_wing) is not int
+        or pivot.left_wing != 3
+        or pivot.right_wing != 3
+    ):
+        raise CandidateDataError("regime pivot must bind the exact 3-left/3-right rule")
+    if calendar is not None:
+        calendar.validate_bar(start, end)
+        calendar.validate_bar(confirmed - H1_DURATION, confirmed)
+        confirmation_intervals = open_bar_count(calendar, end, confirmed, H1_DURATION)
+    else:
+        confirmation_intervals = (confirmed - end) / H1_DURATION
+    if confirmation_intervals != 3:
         raise CandidateDataError("regime pivot confirmation time conflicts")
     if available < confirmed:
         raise CandidateDataError("regime pivot availability is backdated")
@@ -420,7 +482,7 @@ def _validate_regimes(
             (event.low_pivots, PivotKind.LOW),
         ):
             for pivot in pivots:
-                _validate_pivot(pivot, kind)
+                _validate_pivot(pivot, kind, policy.calendar)
             if any(
                 pivots[index].pivot_bar_start >= pivots[index + 1].pivot_bar_start
                 for index in range(len(pivots) - 1)
@@ -486,6 +548,8 @@ def _validate_confirmation_event(
         raise CandidateDataError("confirmation event policy fields conflict")
     _require_enum(event.direction, ImpulseDirection, "confirmation direction")
     _validate_m15_interval(event.bar_start, event.bar_end, "confirmation bar")
+    if policy.calendar is not None:
+        policy.calendar.validate_bar(event.bar_start, event.bar_end)
     confirmed = _require_utc(event.confirmed_at, "confirmation confirmed_at")
     available = _require_utc(event.available_at, "confirmation available_at")
     if confirmed != event.bar_end or available < confirmed:
@@ -769,7 +833,11 @@ def _decision(
         reasons=reasons,
         m15_bar_start=bar.start_time,
         m15_bar_end=bar.timestamp,
-        next_m15_open=bar.timestamp,
+        next_m15_open=(
+            bar.timestamp
+            if candidate_policy.calendar is None
+            else next_open_start(candidate_policy.calendar, bar.timestamp)
+        ),
         proposed_entry_at=(
             bar.timestamp if action in (CandidateAction.BUY, CandidateAction.SELL) else None
         ),
@@ -785,7 +853,23 @@ def _decision(
         lifecycle_policy_fingerprint=lifecycle_policy.fingerprint,
         regime_policy_fingerprint=regime_policy.fingerprint,
         confirmation_policy_fingerprint=confirmation_policy.fingerprint,
+        calendar=candidate_policy.calendar,
     )
+
+
+def _next_open_failure(
+    calendar: Optional[SessionCalendarArtifact], bar_end: datetime
+) -> Optional[CandidateReason]:
+    """Do not queue a closing-bar signal for a later session or unknown open."""
+
+    if calendar is None:
+        return None
+    next_start = next_open_start(calendar, bar_end)
+    if next_start + M15_DURATION > calendar.coverage_end:
+        return CandidateReason.CALENDAR_COVERAGE_EXHAUSTED
+    if next_start != bar_end:
+        return CandidateReason.SCHEDULED_CLOSURE_NEXT_OPEN
+    return None
 
 
 def paper_candidate_decisions(
@@ -822,6 +906,15 @@ def paper_candidate_decisions(
 
     if not isinstance(candidate_policy, CandidatePolicy):
         raise TypeError("candidate_policy must be a CandidatePolicy")
+    if not isinstance(regime_policy, RegimePolicy):
+        raise TypeError("regime_policy must be a RegimePolicy")
+    if not isinstance(confirmation_policy, ConfirmationPolicy):
+        raise TypeError("confirmation_policy must be a ConfirmationPolicy")
+    if (
+        regime_policy.calendar != candidate_policy.calendar
+        or confirmation_policy.calendar != candidate_policy.calendar
+    ):
+        raise CandidateDataError("candidate evidence policies must bind the same calendar")
     transitions = _validate_lifecycle(lifecycle, candidate_policy)
     source_regimes = _validate_regimes(regimes, regime_policy)
     source_confirmations = _validate_confirmations(
@@ -862,6 +955,27 @@ def paper_candidate_decisions(
         bar = transition.observation.bar
         entry_deadline = bar.timestamp
         base_available = transition.sealed_through
+
+        next_open_failure = _next_open_failure(candidate_policy.calendar, bar.timestamp)
+        if next_open_failure is not None:
+            decisions.append(
+                _decision(
+                    transition=transition,
+                    action=CandidateAction.NO_TRADE,
+                    reasons=(next_open_failure,),
+                    direction=None,
+                    confirmation=None,
+                    regime=None,
+                    retests=(),
+                    available_at=base_available,
+                    bundle_fingerprint=bundle,
+                    candidate_policy=candidate_policy,
+                    lifecycle_policy=lifecycle_policy,
+                    regime_policy=regime_policy,
+                    confirmation_policy=confirmation_policy,
+                )
+            )
+            continue
 
         if base_available > entry_deadline:
             decisions.append(

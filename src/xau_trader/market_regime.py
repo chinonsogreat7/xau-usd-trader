@@ -27,6 +27,12 @@ from .multitimeframe import (
     H1PivotEvent,
     PivotKind,
 )
+from .session_calendar import SessionCalendarArtifact
+from .session_timing import (
+    SESSION_STRATEGY_SEMANTICS,
+    open_bar_count,
+    validate_calendar,
+)
 
 
 class MarketRegimeDataError(ValueError):
@@ -92,13 +98,14 @@ RegimeKey = Tuple[
 class RegimePolicy:
     """Required semantic choices for H1 structure classification.
 
-    No field has a default: even the first research baseline must state all
-    choices rather than inheriting an implicit interpretation.
+    Each classification choice is required. Omitting a calendar retains the
+    original strictly contiguous interpretation of pivot confirmation times.
     """
 
     structure_rule: StructureRule
     insufficient_evidence: InsufficientEvidencePolicy
     mixed_structure: MixedStructurePolicy
+    calendar: Optional[SessionCalendarArtifact] = None
 
     def __post_init__(self) -> None:
         _require_enum(self.structure_rule, StructureRule, "structure_rule")
@@ -108,12 +115,13 @@ class RegimePolicy:
             "insufficient_evidence",
         )
         _require_enum(self.mixed_structure, MixedStructurePolicy, "mixed_structure")
+        validate_calendar(self.calendar)
 
     @property
     def canonical_identity(self) -> str:
         """Complete, versioned identity of every selected policy field."""
 
-        return ";".join(
+        identity = ";".join(
             (
                 "h1-regime-policy-v1",
                 "structure_rule={}".format(self.structure_rule.value),
@@ -123,6 +131,11 @@ class RegimePolicy:
                 "mixed_structure={}".format(self.mixed_structure.value),
             )
         )
+        if self.calendar is not None:
+            identity += ";session_semantics={};calendar_fingerprint={}".format(
+                SESSION_STRATEGY_SEMANTICS, self.calendar.fingerprint
+            )
+        return identity
 
     @property
     def fingerprint(self) -> str:
@@ -210,7 +223,12 @@ def _require_utc(value: object, field_name: str) -> datetime:
     return value
 
 
-def _validate_pivots(pivots: Sequence[H1PivotEvent]) -> None:
+def _validate_pivots(
+    pivots: Sequence[H1PivotEvent],
+    *,
+    calendar: Optional[SessionCalendarArtifact] = None,
+) -> None:
+    validate_calendar(calendar)
     previous_key: Optional[Tuple[datetime, int]] = None
     seen = set()
     for index, pivot in enumerate(pivots):
@@ -240,8 +258,22 @@ def _validate_pivots(pivots: Sequence[H1PivotEvent]) -> None:
             raise MarketRegimeDataError(
                 "pivot {} must use the confirmed 3-left/3-right rule".format(index)
             )
-        expected_confirmation = end + PIVOT_RIGHT_WING * H1_DURATION
-        if confirmed_at != expected_confirmation:
+        if calendar is None:
+            confirmation_matches = (
+                confirmed_at == end + PIVOT_RIGHT_WING * H1_DURATION
+            )
+        else:
+            calendar.validate_bar(start, end)
+            # Counting only open hours is insufficient on its own: a forged
+            # timestamp after the final actual right-wing bar, but inside a
+            # closure, would have the same count. The confirming hour must
+            # itself be an actual, fully open hour.
+            calendar.validate_bar(confirmed_at - H1_DURATION, confirmed_at)
+            confirmation_matches = (
+                open_bar_count(calendar, end, confirmed_at, H1_DURATION)
+                == PIVOT_RIGHT_WING
+            )
+        if not confirmation_matches:
             raise MarketRegimeDataError(
                 "pivot {} confirmation time conflicts with its right wing".format(index)
             )
@@ -365,14 +397,16 @@ def h1_regime_events(
     lows to be strictly rising.  Bearish requires both pairs to be strictly
     falling.  With complete evidence every mixed or equal pattern is range;
     before both pairs exist the state is unknown.  ``as_of`` filters solely on
-    the exact evidence availability stored by each immutable event.
+    the exact evidence availability stored by each immutable event. When a
+    calendar is selected by the policy, confirmation requires three actual
+    open H1 right-wing bars while retaining real UTC confirmation timestamps.
     """
 
     if not isinstance(policy, RegimePolicy):
         raise TypeError("policy must be a RegimePolicy")
     normalized_as_of = _normalize_as_of(as_of)
     source = tuple(pivots)
-    _validate_pivots(source)
+    _validate_pivots(source, calendar=policy.calendar)
 
     high_history = []
     low_history = []

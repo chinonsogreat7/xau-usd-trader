@@ -6,9 +6,11 @@ intake is a required :class:`ConfirmationPolicy` value; there are no executable
 defaults hidden in the API.
 
 All candle prices are arithmetic bid/ask mid prices.  Input bars define the EMA
-seed anchor, are required to be contiguous UTC-aligned M15 bars, and are never
-silently bridged across a gap.  Event availability is the latest availability
-of every completed bar needed to prove the event.
+seed anchor and require contiguous UTC-aligned M15 bars by default.  EMA-only
+feature diagnostics may explicitly supply a calendar for documented closures;
+calendar-bound policies also enable candle and confirmation detection across
+those closures without fabricated bars.  Event availability is the
+latest availability of every completed bar needed to prove the event.
 """
 
 from dataclasses import dataclass
@@ -21,6 +23,8 @@ from typing import Dict, Iterable, Optional, Sequence, Tuple
 
 from .domain import AvailabilityBasis, QuoteBar
 from .multitimeframe import M15_DURATION, MultiTimeframeDataError
+from .session_calendar import SessionCalendarArtifact
+from .session_timing import SESSION_STRATEGY_SEMANTICS, validate_calendar
 from .supply_demand import ImpulseDirection
 
 
@@ -163,8 +167,10 @@ class ConfirmationPolicy:
     candle_combination: CandleCombination
     touch_bar_confirmation: TouchBarConfirmation
     confirmation_expiry_bars: int
+    calendar: Optional[SessionCalendarArtifact] = None
 
     def __post_init__(self) -> None:
+        validate_calendar(self.calendar)
         _require_positive_integer(self.ema_period, "ema_period")
         _require_enum(
             self.ema_initialization, EmaInitialization, "ema_initialization"
@@ -211,7 +217,7 @@ class ConfirmationPolicy:
     def canonical_identity(self) -> str:
         """Versioned identity containing every selected policy field."""
 
-        return ";".join(
+        identity = ";".join(
             (
                 "m15-confirmation-policy-v1",
                 "ema_period={}".format(self.ema_period),
@@ -236,6 +242,11 @@ class ConfirmationPolicy:
                 ),
             )
         )
+        if self.calendar is not None:
+            identity += ";calendar={};session_semantics={}".format(
+                self.calendar.fingerprint, SESSION_STRATEGY_SEMANTICS
+            )
+        return identity
 
     @property
     def fingerprint(self) -> str:
@@ -436,7 +447,15 @@ def _normalize_as_of(as_of: Optional[datetime]) -> Optional[datetime]:
     return as_of.astimezone(timezone.utc)
 
 
-def _validate_m15_bars(bars: Sequence[QuoteBar]) -> None:
+def _validate_m15_bars(
+    bars: Sequence[QuoteBar],
+    *,
+    calendar: Optional[SessionCalendarArtifact] = None,
+) -> None:
+    if calendar is not None:
+        if not isinstance(calendar, SessionCalendarArtifact):
+            raise TypeError("calendar must be a SessionCalendarArtifact")
+        calendar.require_hour_aligned_closures()
     for index, bar in enumerate(bars):
         if not isinstance(bar, QuoteBar):
             raise TypeError("M15 input must contain QuoteBar values")
@@ -476,7 +495,11 @@ def _validate_m15_bars(bars: Sequence[QuoteBar]) -> None:
             raise MultiTimeframeDataError(
                 "M15 bar {} is not aligned to a UTC 15-minute boundary".format(index)
             )
-        if index and bar.start_time != bars[index - 1].timestamp:
+        if calendar is not None:
+            calendar.validate_bar(bar.start_time, bar.timestamp)
+            if index:
+                calendar.validate_transition(bars[index - 1].timestamp, bar.start_time)
+        elif index and bar.start_time != bars[index - 1].timestamp:
             raise MultiTimeframeDataError(
                 "M15 bar {} is not contiguous with the previous bar".format(index)
             )
@@ -615,20 +638,29 @@ def m15_ema_events(
     bars: Iterable[QuoteBar],
     *,
     policy: ConfirmationPolicy,
-    as_of: Optional[datetime] = None
+    as_of: Optional[datetime] = None,
+    calendar: Optional[SessionCalendarArtifact] = None,
 ) -> Tuple[EmaEvent, ...]:
     """Return EMA snapshots under the selected seed convention.
 
     A first-close seed emits from the first supplied bar.  An SMA-period seed
     emits first on bar ``period``.  Recursive EMA availability retains the full
     seed-to-current dependency chain.
+    An explicit calendar permits documented full-hour closures for feature
+    diagnostics, preserving the seed and recursive state across the closure.
+    A policy-bound calendar is inferred; a conflicting explicit calendar is
+    rejected.  An unbound policy retains the feature-only calendar override.
     """
 
     if not isinstance(policy, ConfirmationPolicy):
         raise TypeError("policy must be a ConfirmationPolicy")
+    if policy.calendar is not None:
+        if calendar is not None and calendar != policy.calendar:
+            raise ValueError("explicit calendar conflicts with confirmation policy")
+        calendar = policy.calendar
     normalized_as_of = _normalize_as_of(as_of)
     source = tuple(bars)
-    _validate_m15_bars(source)
+    _validate_m15_bars(source, calendar=calendar)
     calculations = _ema_calculations(source, policy)
     return tuple(
         calculation.event
@@ -794,7 +826,7 @@ def m15_candle_events(
         raise TypeError("policy must be a ConfirmationPolicy")
     normalized_as_of = _normalize_as_of(as_of)
     source = tuple(bars)
-    _validate_m15_bars(source)
+    _validate_m15_bars(source, calendar=policy.calendar)
     calculations = _pattern_calculations(source, policy)
     return tuple(
         calculation.event
@@ -883,7 +915,7 @@ def m15_confirmation_events(
         raise TypeError("policy must be a ConfirmationPolicy")
     normalized_as_of = _normalize_as_of(as_of)
     source = tuple(bars)
-    _validate_m15_bars(source)
+    _validate_m15_bars(source, calendar=policy.calendar)
     ema = _ema_calculations(source, policy)
     pattern_calculations = _pattern_calculations(source, policy)
     patterns_by_bar_direction = {}  # type: Dict[Tuple[int, ImpulseDirection], Dict[CandlePatternKind, _PatternCalculation]]
@@ -968,11 +1000,12 @@ def confirmation_time_eligible_for_touch(
 ) -> bool:
     """Return whether a confirmation bar lies inside the selected touch window.
 
-    ``confirmation_expiry_bars`` is the maximum number of M15 bar intervals
+    ``confirmation_expiry_bars`` is the maximum number of elapsed M15 intervals
     between the touch bar's end and confirmation bar's end.  Zero therefore
     means touch-bar-only when touch-bar confirmation is allowed.  This helper
     checks structural timing only; integration must also gate the retest and
-    confirmation by their availability timestamps.
+    confirmation by their availability timestamps.  Scheduled closures do not
+    pause this elapsed-time expiry clock.
     """
 
     if not isinstance(event, ConfirmationEvent):
@@ -983,6 +1016,9 @@ def confirmation_time_eligible_for_touch(
         raise ValueError("event policy fingerprint conflicts with policy")
     _validate_m15_interval(event.bar_start, event.bar_end, "confirmation bar")
     _validate_m15_interval(touch_bar_start, touch_bar_end, "touch bar")
+    if policy.calendar is not None:
+        policy.calendar.validate_bar(event.bar_start, event.bar_end)
+        policy.calendar.validate_bar(touch_bar_start, touch_bar_end)
     intervals = (event.bar_end - touch_bar_end) / M15_DURATION
     if not float(intervals).is_integer():
         return False

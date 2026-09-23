@@ -3,6 +3,7 @@
 import csv
 from datetime import datetime, timedelta, timezone
 import hashlib
+import io
 import math
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Union
@@ -113,26 +114,35 @@ def write_quote_bars_csv(path: Union[str, Path], bars: Iterable[QuoteBar]) -> No
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     with destination.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
-        writer.writeheader()
-        for bar in bars:
-            writer.writerow(
-                {
-                    "start_time": bar.start_time.isoformat(),
-                    "timestamp": bar.timestamp.isoformat(),
-                    "available_at": bar.available_at.isoformat(),
-                    "availability_basis": bar.availability_basis.value,
-                    "bid_open": bar.bid_open,
-                    "bid_high": bar.bid_high,
-                    "bid_low": bar.bid_low,
-                    "bid_close": bar.bid_close,
-                    "ask_open": bar.ask_open,
-                    "ask_high": bar.ask_high,
-                    "ask_low": bar.ask_low,
-                    "ask_close": bar.ask_close,
-                    "volume": "" if bar.volume is None else bar.volume,
-                }
-            )
+        _write_quote_bars(handle, bars)
+
+
+def _write_quote_bars(handle, bars: Iterable[QuoteBar]) -> None:
+    writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
+    writer.writeheader()
+    for bar in bars:
+        writer.writerow({
+            "start_time": bar.start_time.isoformat(),
+            "timestamp": bar.timestamp.isoformat(),
+            "available_at": bar.available_at.isoformat(),
+            "availability_basis": bar.availability_basis.value,
+            "bid_open": bar.bid_open,
+            "bid_high": bar.bid_high,
+            "bid_low": bar.bid_low,
+            "bid_close": bar.bid_close,
+            "ask_open": bar.ask_open,
+            "ask_high": bar.ask_high,
+            "ask_low": bar.ask_low,
+            "ask_close": bar.ask_close,
+            "volume": "" if bar.volume is None else bar.volume,
+        })
+
+
+def quote_bars_csv_bytes(bars: Iterable[QuoteBar]) -> bytes:
+    """Serialize with exactly the file writer's schema and newline convention."""
+    handle = io.StringIO(newline="")
+    _write_quote_bars(handle, bars)
+    return handle.getvalue().encode("utf-8")
 
 
 def sha256_file(path: Union[str, Path]) -> str:

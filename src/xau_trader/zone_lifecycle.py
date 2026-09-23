@@ -5,7 +5,7 @@ formations into auditable H1 invalidation and M15 retest-episode events.  It
 contains no order, broker, account, backtest, sizing, or P&L behavior.
 
 Every unresolved interpretation is selected in ``ZoneLifecyclePolicy``.  The
-policy intentionally has no defaults, so a caller cannot silently choose zone
+strategy policy intentionally has no defaults, so a caller cannot silently choose zone
 freshness, timestamp precedence, overlap selection, or a price basis.
 Streaming transitions accept only watermark-sealed availability groups; the
 receipt collector is the explicit completeness trust boundary.
@@ -20,6 +20,13 @@ from typing import Iterable, Optional, Tuple, Union
 
 from .domain import AvailabilityBasis, QuoteBar
 from .multitimeframe import H1_DURATION, M15_DURATION, MultiTimeframeDataError
+from .session_calendar import SessionCalendarArtifact
+from .session_timing import (
+    SESSION_STRATEGY_SEMANTICS,
+    next_open_start,
+    open_bar_count,
+    validate_calendar,
+)
 from .supply_demand import (
     IMPULSE_WINDOW_BARS,
     ImpulseDirection,
@@ -76,8 +83,9 @@ class EpisodeEndReason(str, Enum):
 class ZoneLifecyclePolicy:
     """All material choices for one immutable lifecycle run.
 
-    There are deliberately no field defaults.  Passing enum values, rather than
-    their strings, makes accidental or misspelled policy choices fail closed.
+    Strategy choices have no defaults. ``calendar=None`` preserves strict
+    contiguous history. Passing enum values, rather than their strings, makes
+    accidental or misspelled policy choices fail closed.
     """
 
     retest_policy: RetestPolicy
@@ -85,6 +93,7 @@ class ZoneLifecyclePolicy:
     equal_time_order: EqualTimeOrder
     overlap_selection: OverlapSelection
     price_basis: ZonePriceBasis
+    calendar: Optional[SessionCalendarArtifact] = None
 
     def __post_init__(self) -> None:
         _require_enum(self.retest_policy, RetestPolicy, "retest_policy")
@@ -92,12 +101,13 @@ class ZoneLifecyclePolicy:
         _require_enum(self.equal_time_order, EqualTimeOrder, "equal_time_order")
         _require_enum(self.overlap_selection, OverlapSelection, "overlap_selection")
         _require_enum(self.price_basis, ZonePriceBasis, "price_basis")
+        validate_calendar(self.calendar)
 
     @property
     def canonical_identity(self) -> str:
         """Complete versioned identity for every lifecycle-policy choice."""
 
-        return ";".join(
+        identity = ";".join(
             (
                 "zone-lifecycle-policy-v1",
                 "retest_policy={}".format(self.retest_policy.value),
@@ -107,6 +117,11 @@ class ZoneLifecyclePolicy:
                 "price_basis={}".format(self.price_basis.value),
             )
         )
+        if self.calendar is not None:
+            identity += ";session_semantics={};calendar={}".format(
+                SESSION_STRATEGY_SEMANTICS, self.calendar.fingerprint
+            )
+        return identity
 
     @property
     def fingerprint(self) -> str:
@@ -141,8 +156,10 @@ class SealedAvailabilityGroup:
     sealed_through: datetime
     observations: Tuple[CompletedBarObservation, ...]
     formations: Tuple[ZoneEvent, ...]
+    calendar: Optional[SessionCalendarArtifact] = None
 
     def __post_init__(self) -> None:
+        validate_calendar(self.calendar)
         for value, name in (
             (self.available_at, "available_at"),
             (self.sealed_through, "sealed_through"),
@@ -170,8 +187,10 @@ class SealedAvailabilityGroup:
                 raise ValueError(
                     "availability group observations must share available_at"
                 )
+            _validate_calendar_bar(self.calendar, observation.bar)
         for zone in self.formations:
             _validate_zone(zone)
+            _require_same_calendar(zone.calendar, self.calendar)
             if zone.available_at != self.available_at:
                 raise ValueError(
                     "availability group formations must share available_at"
@@ -225,6 +244,8 @@ class ZoneState:
         _validate_anchor(
             self.next_m15_start, ObservationTimeframe.M15, "next_m15_start"
         )
+        _validate_calendar_anchor(self.zone.calendar, self.next_h1_start)
+        _validate_calendar_anchor(self.zone.calendar, self.next_m15_start)
         invalidation_values = (
             self.invalidating_h1_start,
             self.invalidating_h1_end,
@@ -332,10 +353,13 @@ class ZoneObservationTransition:
     states_before: Tuple[ZoneState, ...]
     states_after: Tuple[ZoneState, ...]
     events: Tuple[ZoneLifecycleEvent, ...]
+    calendar: Optional[SessionCalendarArtifact] = None
 
     def __post_init__(self) -> None:
+        validate_calendar(self.calendar)
         if not isinstance(self.observation, CompletedBarObservation):
             raise TypeError("transition observation must be a CompletedBarObservation")
+        _validate_calendar_bar(self.calendar, self.observation.bar)
         _validate_policy_fingerprint(
             self.policy_fingerprint, "transition policy_fingerprint"
         )
@@ -366,6 +390,7 @@ class ZoneObservationTransition:
                     raise ValueError(
                         "transition state policy fingerprint conflicts with transition"
                     )
+                _require_same_calendar(state.zone.calendar, self.calendar)
             if tuple(
                 sorted(states, key=lambda item: _zone_sort_key(item.zone))
             ) != states:
@@ -456,12 +481,43 @@ def _validate_policy_fingerprint(value: object, field_name: str) -> None:
         raise ValueError("{} must be a lowercase SHA-256 digest".format(field_name))
 
 
+def _require_same_calendar(
+    left: Optional[SessionCalendarArtifact],
+    right: Optional[SessionCalendarArtifact],
+) -> None:
+    validate_calendar(left)
+    validate_calendar(right)
+    if left != right:
+        raise ValueError("lifecycle calendar conflicts with its bound policy or group")
+
+
+def _validate_calendar_bar(
+    calendar: Optional[SessionCalendarArtifact], bar: QuoteBar
+) -> None:
+    if calendar is not None:
+        calendar.validate_bar(bar.start_time, bar.timestamp)
+
+
+def _validate_calendar_anchor(
+    calendar: Optional[SessionCalendarArtifact], value: datetime
+) -> None:
+    if calendar is not None and next_open_start(calendar, value) != value:
+        raise ValueError("lifecycle cadence anchor cannot fall inside a closure")
+
+
+def _next_start(
+    calendar: Optional[SessionCalendarArtifact], value: datetime
+) -> datetime:
+    return value if calendar is None else next_open_start(calendar, value)
+
+
 def _validate_zone(zone: ZoneEvent) -> None:
     if not isinstance(zone, ZoneEvent):
         raise TypeError("zone must be a ZoneEvent")
     _require_enum(zone.kind, ZoneKind, "zone kind")
     _require_enum(zone.origin_policy, OriginSelectionPolicy, "origin_policy")
     _require_enum(zone.availability_basis, AvailabilityBasis, "availability_basis")
+    validate_calendar(zone.calendar)
     if isinstance(zone.origin_lookback_bars, bool) or not isinstance(
         zone.origin_lookback_bars, int
     ):
@@ -489,9 +545,15 @@ def _validate_zone(zone: ZoneEvent) -> None:
         or zone.origin_bar_start.microsecond
     ):
         raise ValueError("zone origin must be aligned to a UTC hour")
-    if zone.impulse_window_end - zone.impulse_window_start != (
-        H1_DURATION * IMPULSE_WINDOW_BARS
-    ):
+    impulse_duration_valid = (
+        zone.impulse_window_end - zone.impulse_window_start
+        == H1_DURATION * IMPULSE_WINDOW_BARS
+        if zone.calendar is None else open_bar_count(
+            zone.calendar, zone.impulse_window_start, zone.impulse_window_end,
+            H1_DURATION,
+        ) == IMPULSE_WINDOW_BARS
+    )
+    if not impulse_duration_valid:
         raise ValueError("zone impulse window must span exactly four H1 bars")
     for value in (zone.impulse_window_start, zone.impulse_window_end):
         if value.minute or value.second or value.microsecond:
@@ -500,10 +562,26 @@ def _validate_zone(zone: ZoneEvent) -> None:
         raise ValueError("zone impulse_window_end must equal formed_at")
     if zone.origin_bar_end > zone.impulse_window_end:
         raise ValueError("zone origin cannot end after the impulse window")
-    earliest_origin_start = zone.impulse_window_start - (
-        H1_DURATION * zone.origin_lookback_bars
-    )
-    if zone.origin_bar_start < earliest_origin_start:
+    if zone.calendar is not None:
+        zone.calendar.validate_bar(zone.origin_bar_start, zone.origin_bar_end)
+        zone.calendar.validate_bar(
+            zone.impulse_window_start, zone.impulse_window_start + H1_DURATION
+        )
+        zone.calendar.validate_bar(
+            zone.impulse_window_end - H1_DURATION, zone.impulse_window_end
+        )
+    if zone.calendar is None:
+        lookback_exceeded = zone.origin_bar_start < zone.impulse_window_start - (
+            H1_DURATION * zone.origin_lookback_bars
+        )
+    else:
+        lookback_exceeded = (
+            zone.origin_bar_start < zone.impulse_window_start and open_bar_count(
+                zone.calendar, zone.origin_bar_start, zone.impulse_window_start,
+                H1_DURATION,
+            ) > zone.origin_lookback_bars
+        )
+    if lookback_exceeded:
         raise ValueError("zone origin exceeds its declared finite lookback")
     if (
         zone.origin_policy == OriginSelectionPolicy.LAST_OPPOSITE_BEFORE_WINDOW
@@ -581,13 +659,20 @@ def _validate_anchor(
 
 
 def _first_full_bar_start(
-    available_at: datetime, timeframe: ObservationTimeframe
+    available_at: datetime,
+    timeframe: ObservationTimeframe,
+    calendar: Optional[SessionCalendarArtifact] = None,
 ) -> datetime:
     """Earliest aligned bar start at or after an event became visible.
 
     Equality is inclusive: a zone visible exactly at a boundary may use the bar
     beginning at that boundary.  A zone visible inside a bar waits for the next
     boundary, so no partial pre-visibility OHLC can affect its lifecycle.
+    When receipts outlive the finite calendar, its timeframe-floored end is an
+    exhausted sentinel, not an inferred future open. A complete bar beginning
+    there cannot fit in coverage (including a calendar with a partial tail).
+    Actual availability is never changed: the source-bar visibility guard and
+    calendar interval validation still apply before any lifecycle effect.
     """
 
     if timeframe == ObservationTimeframe.H1:
@@ -600,7 +685,14 @@ def _first_full_bar_start(
             microsecond=0,
         )
         duration = M15_DURATION
-    return floor if floor == available_at else floor + duration
+    aligned = floor if floor == available_at else floor + duration
+    if calendar is not None and aligned > calendar.coverage_end:
+        end = calendar.coverage_end
+        minute = 0 if timeframe == ObservationTimeframe.H1 else (end.minute // 15) * 15
+        exhausted = end.replace(minute=minute, second=0, microsecond=0)
+        _validate_calendar_anchor(calendar, exhausted)
+        return exhausted
+    return _next_start(calendar, aligned)
 
 
 def _zone_sort_key(zone: ZoneEvent) -> tuple:
@@ -649,6 +741,7 @@ def initial_zone_state(
     _validate_zone(zone)
     if not isinstance(policy, ZoneLifecyclePolicy):
         raise TypeError("policy must be a ZoneLifecyclePolicy")
+    _require_same_calendar(zone.calendar, policy.calendar)
     _validate_anchor(h1_start, ObservationTimeframe.H1, "h1_start")
     _validate_anchor(m15_start, ObservationTimeframe.M15, "m15_start")
     return ZoneState(
@@ -661,10 +754,10 @@ def initial_zone_state(
         invalidating_h1_end=None,
         invalidated_at=None,
         next_h1_start=_first_full_bar_start(
-            max(zone.available_at, h1_start), ObservationTimeframe.H1
+            max(zone.available_at, h1_start), ObservationTimeframe.H1, policy.calendar
         ),
         next_m15_start=_first_full_bar_start(
-            max(zone.available_at, m15_start), ObservationTimeframe.M15
+            max(zone.available_at, m15_start), ObservationTimeframe.M15, policy.calendar
         ),
     )
 
@@ -679,12 +772,14 @@ def _apply_h1_close(
     if not isinstance(policy, ZoneLifecyclePolicy):
         raise TypeError("policy must be a ZoneLifecyclePolicy")
     _validate_bar(ObservationTimeframe.H1, bar)
+    _require_same_calendar(state.zone.calendar, policy.calendar)
+    _validate_calendar_bar(policy.calendar, bar)
     zone = state.zone
     if bar.start_time < state.next_h1_start:
         return ZoneUpdate(state=state, events=())
     if bar.start_time > state.next_h1_start:
         raise MultiTimeframeDataError("zone H1 cadence omitted a full bar")
-    advanced = replace(state, next_h1_start=bar.timestamp)
+    advanced = replace(state, next_h1_start=_next_start(policy.calendar, bar.timestamp))
     if not state.valid or bar.start_time < zone.available_at:
         return ZoneUpdate(state=advanced, events=())
 
@@ -752,12 +847,14 @@ def _apply_m15_close(
     if not isinstance(policy, ZoneLifecyclePolicy):
         raise TypeError("policy must be a ZoneLifecyclePolicy")
     _validate_bar(ObservationTimeframe.M15, bar)
+    _require_same_calendar(state.zone.calendar, policy.calendar)
+    _validate_calendar_bar(policy.calendar, bar)
     zone = state.zone
     if bar.start_time < state.next_m15_start:
         return ZoneUpdate(state=state, events=())
     if bar.start_time > state.next_m15_start:
         raise MultiTimeframeDataError("zone M15 cadence omitted a full bar")
-    advanced = replace(state, next_m15_start=bar.timestamp)
+    advanced = replace(state, next_m15_start=_next_start(policy.calendar, bar.timestamp))
     if not state.valid or bar.start_time < zone.available_at:
         return ZoneUpdate(state=advanced, events=())
 
@@ -867,6 +964,7 @@ def seal_availability_group(
     formations: Iterable[ZoneEvent],
     *,
     sealed_through: datetime,
+    calendar: Optional[SessionCalendarArtifact] = None,
 ) -> SealedAvailabilityGroup:
     """Close one complete same-availability receipt group at a watermark."""
 
@@ -894,6 +992,7 @@ def seal_availability_group(
         sealed_through=sealed_through,
         observations=source_observations,
         formations=source_formations,
+        calendar=calendar,
     )
 
 
@@ -901,6 +1000,7 @@ def _validate_state(state: ZoneState, policy: ZoneLifecyclePolicy) -> None:
     if not isinstance(state, ZoneState):
         raise TypeError("book states must contain ZoneState values")
     _validate_zone(state.zone)
+    _require_same_calendar(state.zone.calendar, policy.calendar)
     _validate_policy_fingerprint(
         state.policy_fingerprint, "zone state policy_fingerprint"
     )
@@ -918,12 +1018,14 @@ def _validate_state(state: ZoneState, policy: ZoneLifecyclePolicy) -> None:
     _validate_anchor(
         state.next_m15_start, ObservationTimeframe.M15, "next_m15_start"
     )
+    _validate_calendar_anchor(policy.calendar, state.next_h1_start)
+    _validate_calendar_anchor(policy.calendar, state.next_m15_start)
     if state.next_h1_start < _first_full_bar_start(
-        state.zone.available_at, ObservationTimeframe.H1
+        state.zone.available_at, ObservationTimeframe.H1, policy.calendar
     ):
         raise ValueError("zone H1 anchor precedes zone visibility")
     if state.next_m15_start < _first_full_bar_start(
-        state.zone.available_at, ObservationTimeframe.M15
+        state.zone.available_at, ObservationTimeframe.M15, policy.calendar
     ):
         raise ValueError("zone M15 anchor precedes zone visibility")
     if state.active_episode is not None:
@@ -956,6 +1058,13 @@ def _validate_state(state: ZoneState, policy: ZoneLifecyclePolicy) -> None:
             raise ValueError("active episode last touch cannot precede its first touch")
         if episode.last_touch_available_at < episode.last_touch_bar_end:
             raise ValueError("active episode last touch availability is backdated")
+        if policy.calendar is not None:
+            policy.calendar.validate_bar(
+                episode.first_touch_bar_start, episode.first_touch_bar_end
+            )
+            policy.calendar.validate_bar(
+                episode.last_touch_bar_end - M15_DURATION, episode.last_touch_bar_end
+            )
     invalidation = (
         state.invalidating_h1_start,
         state.invalidating_h1_end,
@@ -973,6 +1082,10 @@ def _validate_state(state: ZoneState, policy: ZoneLifecyclePolicy) -> None:
             raise ValueError("invalidation source must span one H1 bar")
         if state.invalidated_at < state.invalidating_h1_end:
             raise ValueError("zone invalidation availability is backdated")
+        if policy.calendar is not None:
+            policy.calendar.validate_bar(
+                state.invalidating_h1_start, state.invalidating_h1_end
+            )
 
 
 def _validate_book(book: ZoneBook) -> None:
@@ -991,6 +1104,8 @@ def _validate_book(book: ZoneBook) -> None:
     _validate_anchor(
         book.next_m15_start, ObservationTimeframe.M15, "next_m15_start"
     )
+    _validate_calendar_anchor(book.policy.calendar, book.next_h1_start)
+    _validate_calendar_anchor(book.policy.calendar, book.next_m15_start)
     if book.last_group_available_at is not None:
         if (
             not isinstance(book.last_group_available_at, datetime)
@@ -1015,13 +1130,13 @@ def _validate_book(book: ZoneBook) -> None:
         expected_h1 = max(
             book.next_h1_start,
             _first_full_bar_start(
-                state.zone.available_at, ObservationTimeframe.H1
+                state.zone.available_at, ObservationTimeframe.H1, book.policy.calendar
             ),
         )
         expected_m15 = max(
             book.next_m15_start,
             _first_full_bar_start(
-                state.zone.available_at, ObservationTimeframe.M15
+                state.zone.available_at, ObservationTimeframe.M15, book.policy.calendar
             ),
         )
         if state.next_h1_start != expected_h1:
@@ -1049,6 +1164,7 @@ def _validate_transition_against_policy(
         raise ValueError(
             "transition policy fingerprint conflicts with the book policy"
         )
+    _require_same_calendar(transition.calendar, policy.calendar)
     for state in transition.states_before:
         _validate_state(state, policy)
     for state in transition.states_after:
@@ -1105,8 +1221,20 @@ def _validate_zone_book_update(update: ZoneBookUpdate) -> None:
     flattened_events = []  # type: list
     previous_transition = None  # type: Optional[ZoneObservationTransition]
     previous_order_key = None  # type: Optional[ObservationOrderKey]
+    calendar_next_starts = {}
     for transition in update.transitions:
         _validate_transition_against_policy(transition, update.book.policy)
+        if update.book.policy.calendar is not None:
+            timeframe = transition.observation.timeframe
+            bar = transition.observation.bar
+            if (
+                timeframe in calendar_next_starts
+                and bar.start_time != calendar_next_starts[timeframe]
+            ):
+                raise ValueError("transition ledger omitted an open bar or repeated a bar")
+            calendar_next_starts[timeframe] = _next_start(
+                update.book.policy.calendar, bar.timestamp
+            )
         flattened_events.extend(transition.events)
         current_order_key = observation_order_key(
             transition.observation, update.book.policy
@@ -1141,6 +1269,14 @@ def _validate_zone_book_update(update: ZoneBookUpdate) -> None:
             )
         previous_transition = transition
         previous_order_key = current_order_key
+
+    for timeframe, expected_start in calendar_next_starts.items():
+        actual_start = (
+            update.book.next_h1_start
+            if timeframe == ObservationTimeframe.H1 else update.book.next_m15_start
+        )
+        if actual_start != expected_start:
+            raise ValueError("final book cadence conflicts with its transition ledger")
 
     if update.events != tuple(flattened_events):
         raise ValueError(
@@ -1185,9 +1321,12 @@ def new_zone_book(
     _validate_anchor(h1_start, ObservationTimeframe.H1, "h1_start")
     _validate_anchor(m15_start, ObservationTimeframe.M15, "m15_start")
     source = tuple(zones)
+    h1_start = _next_start(policy.calendar, h1_start)
+    m15_start = _next_start(policy.calendar, m15_start)
     admission_cutoff = min(h1_start, m15_start)
     for zone in source:
         _validate_zone(zone)
+        _require_same_calendar(zone.calendar, policy.calendar)
         if zone.available_at > admission_cutoff:
             raise ValueError(
                 "future zone must be admitted at its availability group"
@@ -1232,6 +1371,7 @@ def advance_zone_book_group(
     _validate_book(book)
     if not isinstance(group, SealedAvailabilityGroup):
         raise TypeError("group must be a SealedAvailabilityGroup")
+    _require_same_calendar(group.calendar, book.policy.calendar)
     source_observations = group.observations
     source_formations = group.formations
     for observation in source_observations:
@@ -1241,8 +1381,10 @@ def advance_zone_book_group(
         if not isinstance(observation.bar, QuoteBar):
             raise TypeError("observation bar must be a QuoteBar")
         _validate_bar(observation.timeframe, observation.bar)
+        _validate_calendar_bar(book.policy.calendar, observation.bar)
     for zone in source_formations:
         _validate_zone(zone)
+        _require_same_calendar(zone.calendar, book.policy.calendar)
     group_at = group.available_at
     if (
         book.sealed_through is not None
@@ -1277,13 +1419,13 @@ def advance_zone_book_group(
                 raise MultiTimeframeDataError(
                     "H1 observation does not match the explicit cadence anchor"
                 )
-            next_h1 = observation.bar.timestamp
+            next_h1 = _next_start(book.policy.calendar, observation.bar.timestamp)
         else:
             if observation.bar.start_time != next_m15:
                 raise MultiTimeframeDataError(
                     "M15 observation does not match the explicit cadence anchor"
                 )
-            next_m15 = observation.bar.timestamp
+            next_m15 = _next_start(book.policy.calendar, observation.bar.timestamp)
 
     states = list(book.states)
     for zone in sorted(source_formations, key=_zone_sort_key):
@@ -1321,6 +1463,7 @@ def advance_zone_book_group(
                 states_before=states_before,
                 states_after=tuple(states),
                 events=tuple(step_events),
+                calendar=book.policy.calendar,
             )
         )
     result = ZoneBook(
@@ -1372,6 +1515,7 @@ def evolve_zone_book(
                 tuple(group_observations),
                 tuple(group_formations),
                 sealed_through=available_at,
+                calendar=policy.calendar,
             ),
         )
         book = update.book
@@ -1401,6 +1545,7 @@ def select_retest_starts(
         raise TypeError("starts must contain RetestEpisodeStarted values")
     for event in source:
         _validate_zone(event.zone)
+        _require_same_calendar(event.zone.calendar, policy.calendar)
         _validate_policy_fingerprint(
             event.policy_fingerprint, "retest start policy_fingerprint"
         )
@@ -1426,6 +1571,8 @@ def select_retest_starts(
             raise ValueError("retest start must span one M15 bar")
         if event.available_at < event.m15_bar_end:
             raise ValueError("retest start availability cannot be backdated")
+        if policy.calendar is not None:
+            policy.calendar.validate_bar(event.m15_bar_start, event.m15_bar_end)
     if source:
         source_bar = (
             source[0].m15_bar_start,

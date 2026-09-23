@@ -21,6 +21,8 @@ from typing import Iterable, Optional, Sequence, Tuple
 
 from .domain import AvailabilityBasis, QuoteBar
 from .multitimeframe import H1_DURATION, MultiTimeframeDataError
+from .session_calendar import SessionCalendarArtifact
+from .session_timing import SESSION_STRATEGY_SEMANTICS, validate_calendar
 
 
 IMPULSE_WINDOW_BARS = 4
@@ -102,6 +104,7 @@ class ImpulsePolicy:
     minimum_directional_bars: int
     movement_atr_multiple: float
     body_atr_multiple: float
+    calendar: Optional[SessionCalendarArtifact] = None
 
     def __post_init__(self) -> None:
         _require_enum(self.movement, ImpulseMovementPolicy, "movement")
@@ -122,12 +125,13 @@ class ImpulsePolicy:
             self.movement_atr_multiple, "movement_atr_multiple"
         )
         _require_non_negative_finite(self.body_atr_multiple, "body_atr_multiple")
+        validate_calendar(self.calendar)
 
     @property
     def canonical_identity(self) -> str:
         """Complete versioned policy identity with canonical numeric strings."""
 
-        return ";".join(
+        identity = ";".join(
             (
                 "impulse-policy-v1",
                 "movement={}".format(self.movement.value),
@@ -145,6 +149,11 @@ class ImpulsePolicy:
                 ),
             )
         )
+        if self.calendar is not None:
+            identity += ";session_semantics={};calendar_fingerprint={}".format(
+                SESSION_STRATEGY_SEMANTICS, self.calendar.fingerprint
+            )
+        return identity
 
     @property
     def fingerprint(self) -> str:
@@ -226,6 +235,7 @@ class ZoneEvent:
     lower_price: float
     upper_price: float
     impulse_key: ImpulseKey
+    calendar: Optional[SessionCalendarArtifact] = None
 
     @property
     def key(self) -> ZoneKey:
@@ -289,7 +299,15 @@ def _normalize_as_of(as_of: Optional[datetime]) -> Optional[datetime]:
     return as_of.astimezone(timezone.utc)
 
 
-def _validate_h1_bars(bars: Sequence[QuoteBar]) -> None:
+def _validate_h1_bars(
+    bars: Sequence[QuoteBar],
+    *,
+    calendar: Optional[SessionCalendarArtifact] = None,
+) -> None:
+    if calendar is not None:
+        if not isinstance(calendar, SessionCalendarArtifact):
+            raise TypeError("calendar must be a SessionCalendarArtifact")
+        calendar.require_hour_aligned_closures()
     for index, bar in enumerate(bars):
         if not isinstance(bar, QuoteBar):
             raise TypeError("H1 input must contain QuoteBar values")
@@ -307,7 +325,11 @@ def _validate_h1_bars(bars: Sequence[QuoteBar]) -> None:
             raise MultiTimeframeDataError(
                 "H1 bar {} is not aligned to a UTC hour boundary".format(index)
             )
-        if index and bar.start_time != bars[index - 1].timestamp:
+        if calendar is not None:
+            calendar.validate_bar(bar.start_time, bar.timestamp)
+            if index:
+                calendar.validate_transition(bars[index - 1].timestamp, bar.start_time)
+        elif index and bar.start_time != bars[index - 1].timestamp:
             raise MultiTimeframeDataError(
                 "H1 bar {} is not contiguous with the previous bar".format(index)
             )
@@ -402,7 +424,8 @@ def h1_atr_events(
     *,
     period: int,
     method: AtrMethod,
-    as_of: Optional[datetime] = None
+    as_of: Optional[datetime] = None,
+    calendar: Optional[SessionCalendarArtifact] = None,
 ) -> Tuple[AtrEvent, ...]:
     """Return deterministic H1 ATR snapshots after a complete warm-up.
 
@@ -410,10 +433,13 @@ def h1_atr_events(
     its seed.  SMA ATR is a rolling mean.  The first data bar's true range is its
     high-low range; subsequent true ranges use the prior close.  Availability is
     the latest availability among the exact bars on which each value depends.
+    An explicit calendar permits documented full-hour closures for feature
+    diagnostics, retaining the previous traded close and recursive ATR history.
+    Impulse and zone detectors select calendar semantics through their policy.
     """
 
     source = tuple(bars)
-    _validate_h1_bars(source)
+    _validate_h1_bars(source, calendar=calendar)
     if isinstance(period, bool) or not isinstance(period, int):
         raise TypeError("period must be an integer")
     if period < 1:
@@ -536,14 +562,15 @@ def h1_impulse_events(
     Bullish is emitted before bearish if a future custom directional threshold
     ever allows both sides to qualify for one window.  ``as_of`` filters on the
     latest availability of the window and its exact ATR dependencies, never just
-    on candle close time.
+    on candle close time. With ``policy.calendar``, the window remains four
+    actual H1 bars across exact declared closures; timestamps are not compressed.
     """
 
     if not isinstance(policy, ImpulsePolicy):
         raise TypeError("policy must be an ImpulsePolicy")
     normalized_as_of = _normalize_as_of(as_of)
     source = tuple(bars)
-    _validate_h1_bars(source)
+    _validate_h1_bars(source, calendar=policy.calendar)
     calculations = _atr_calculations(
         source, period=policy.atr_period, method=policy.atr_method
     )
@@ -608,6 +635,7 @@ def _zone_event(
     origin_proof_bars: Sequence[QuoteBar],
     origin_policy: OriginSelectionPolicy,
     origin_lookback_bars: int,
+    calendar: Optional[SessionCalendarArtifact],
 ) -> ZoneEvent:
     if impulse.direction == ImpulseDirection.BULLISH:
         kind = ZoneKind.DEMAND
@@ -643,6 +671,7 @@ def _zone_event(
         lower_price=lower_price,
         upper_price=upper_price,
         impulse_key=impulse.key,
+        calendar=calendar,
     )
 
 
@@ -660,7 +689,9 @@ def supply_demand_zone_events(
     uses the selected bullish origin's mid open-to-high interval.  The required
     finite ``origin_lookback_bars`` is the number of bars strictly before the
     impulse window that may be searched.  The inclusive policy additionally
-    searches the four impulse bars.  A missing opposite-colour origin produces
+    searches the four impulse bars. With ``impulse_policy.calendar``, these are
+    counts of actual bars, not elapsed hours including closures. A missing
+    opposite-colour origin produces
     no zone.  No retest, invalidation, freshness, overlap selection, or execution
     meaning is attached to these events.
     """
@@ -676,7 +707,7 @@ def supply_demand_zone_events(
         raise ValueError("origin_lookback_bars must be at least 1")
     normalized_as_of = _normalize_as_of(as_of)
     source = tuple(bars)
-    _validate_h1_bars(source)
+    _validate_h1_bars(source, calendar=impulse_policy.calendar)
     impulses = h1_impulse_events(source, policy=impulse_policy)
     start_indexes = {bar.start_time: index for index, bar in enumerate(source)}
 
@@ -702,6 +733,7 @@ def supply_demand_zone_events(
             origin_proof_bars,
             origin_policy,
             origin_lookback_bars,
+            impulse_policy.calendar,
         )
         if normalized_as_of is None or zone.available_at <= normalized_as_of:
             zones.append(zone)

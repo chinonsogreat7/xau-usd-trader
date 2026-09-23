@@ -11,14 +11,19 @@ from enum import Enum
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Sequence, Tuple, Union
+import re
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 from urllib.parse import urlsplit
 
 from .domain import AvailabilityBasis, QuoteBar
 
+if TYPE_CHECKING:
+    from .session_calendar import SessionCalendarArtifact
+
 
 SCHEMA_NAME = "xau_trader.dataset_manifest"
 SCHEMA_VERSION = 1
+SUPPORTED_VERSIONS = (1, 2)
 SUPPORTED_INSTRUMENT = "XAU_USD"
 
 
@@ -161,6 +166,41 @@ def _sha256(value: object, field_name: str) -> str:
             "{} must be a 64-character hexadecimal SHA256 digest".format(field_name)
         )
     return digest
+
+
+def _calendar_sha256(value: object, field_name: str) -> str:
+    """Calendar identities use strict lowercase digests without normalization."""
+
+    if not isinstance(value, str):
+        raise DatasetManifestError("{} must be a string".format(field_name))
+    if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+        raise DatasetManifestError(
+            "{} must be a 64-character lowercase hexadecimal SHA256 digest".format(field_name)
+        )
+    return value
+
+
+def _calendar_artifact_uri(value: object) -> str:
+    field_name = "session_calendar.artifact_uri"
+    clean = _required_text(value, field_name)
+    if any(
+        ord(character) < 32
+        or 127 <= ord(character) <= 159
+        or 0xD800 <= ord(character) <= 0xDFFF
+        for character in value
+    ):
+        raise DatasetManifestError("{} must be a single-line redacted URI".format(field_name))
+    if "?" in clean or "#" in clean:
+        raise DatasetManifestError("{} must omit query strings and fragments".format(field_name))
+    try:
+        parsed = urlsplit(clean)
+    except ValueError as exc:
+        raise DatasetManifestError("{} must be a valid redacted URI".format(field_name)) from exc
+    if parsed.username is not None or parsed.password is not None:
+        raise DatasetManifestError("{} must not contain URL credentials".format(field_name))
+    if re.search(r"\bauthorization\s*[:=]|\b(?:bearer|basic)\s+", clean, re.IGNORECASE):
+        raise DatasetManifestError("{} must not contain credentials".format(field_name))
+    return clean
 
 
 def _integer(value: object, field_name: str) -> int:
@@ -338,6 +378,9 @@ class DatasetRights:
 class SessionCalendar:
     calendar_id: str
     version: str
+    artifact_uri: Optional[str] = None
+    artifact_sha256: Optional[str] = None
+    content_fingerprint: Optional[str] = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -346,6 +389,20 @@ class SessionCalendar:
         object.__setattr__(
             self, "version", _required_text(self.version, "session_calendar.version")
         )
+        artifact_fields = (self.artifact_uri, self.artifact_sha256, self.content_fingerprint)
+        if any(value is not None for value in artifact_fields):
+            if any(value is None for value in artifact_fields):
+                raise DatasetManifestError(
+                    "session_calendar artifact_uri, artifact_sha256, and "
+                    "content_fingerprint must be provided together"
+                )
+            object.__setattr__(self, "artifact_uri", _calendar_artifact_uri(self.artifact_uri))
+            for field_name in ("artifact_sha256", "content_fingerprint"):
+                object.__setattr__(
+                    self,
+                    field_name,
+                    _calendar_sha256(getattr(self, field_name), "session_calendar." + field_name),
+                )
 
 
 @dataclass(frozen=True)
@@ -423,7 +480,7 @@ class DatasetManifest:
             raise DatasetManifestError("schema is not supported")
         object.__setattr__(self, "schema", schema)
         version = _integer(self.version, "version")
-        if version != SCHEMA_VERSION:
+        if version not in SUPPORTED_VERSIONS:
             raise DatasetManifestError("version is not supported")
         object.__setattr__(self, "version", version)
         expected_types = (
@@ -441,10 +498,31 @@ class DatasetManifest:
                 raise DatasetManifestError(
                     "{} must be a {}".format(field_name, expected_type.__name__)
                 )
+        artifact_fields = (
+            self.session_calendar.artifact_uri,
+            self.session_calendar.artifact_sha256,
+            self.session_calendar.content_fingerprint,
+        )
+        if version == 1 and any(value is not None for value in artifact_fields):
+            raise DatasetManifestError("manifest v1 must not contain calendar artifact fields")
+        if version == 2 and any(value is None for value in artifact_fields):
+            raise DatasetManifestError("manifest v2 requires all calendar artifact fields")
         if self.source.retrieved_at < self.coverage.end:
             raise DatasetManifestError("source.retrieved_at cannot precede coverage.end")
 
     def as_dict(self) -> Dict[str, Any]:
+        calendar = {
+            "id": self.session_calendar.calendar_id,
+            "version": self.session_calendar.version,
+        }
+        if self.version == 2:
+            calendar.update(
+                {
+                    "artifact_uri": self.session_calendar.artifact_uri,
+                    "artifact_sha256": self.session_calendar.artifact_sha256,
+                    "content_fingerprint": self.session_calendar.content_fingerprint,
+                }
+            )
         return {
             "schema": self.schema,
             "version": self.version,
@@ -481,10 +559,7 @@ class DatasetManifest:
                 "api_data_agreement_version": self.rights.api_data_agreement_version,
                 "retention_basis": self.rights.retention_basis,
             },
-            "session_calendar": {
-                "id": self.session_calendar.calendar_id,
-                "version": self.session_calendar.version,
-            },
+            "session_calendar": calendar,
             "coverage": {
                 "start": _format_utc(self.coverage.start),
                 "end": _format_utc(self.coverage.end),
@@ -549,6 +624,9 @@ def dataset_manifest_from_dict(payload: Mapping[str, Any]) -> DatasetManifest:
         },
         "manifest",
     )
+    version = _integer(root["version"], "version")
+    if version not in SUPPORTED_VERSIONS:
+        raise DatasetManifestError("version is not supported")
     provider = _mapping(root["provider"], "provider")
     _exact_fields(provider, {"name", "legal_entity"}, "provider")
     instrument = _mapping(root["instrument"], "instrument")
@@ -588,7 +666,10 @@ def dataset_manifest_from_dict(payload: Mapping[str, Any]) -> DatasetManifest:
         "rights",
     )
     calendar = _mapping(root["session_calendar"], "session_calendar")
-    _exact_fields(calendar, {"id", "version"}, "session_calendar")
+    calendar_fields = {"id", "version"}
+    if version == 2:
+        calendar_fields.update({"artifact_uri", "artifact_sha256", "content_fingerprint"})
+    _exact_fields(calendar, calendar_fields, "session_calendar")
     coverage = _mapping(root["coverage"], "coverage")
     _exact_fields(coverage, {"start", "end", "row_count", "known_gaps"}, "coverage")
     request_parameters = _mapping(source["request_parameters"], "source.request_parameters")
@@ -648,7 +729,11 @@ def dataset_manifest_from_dict(payload: Mapping[str, Any]) -> DatasetManifest:
             retention_basis=rights["retention_basis"],
         ),
         session_calendar=SessionCalendar(
-            calendar_id=calendar["id"], version=calendar["version"]
+            calendar_id=calendar["id"],
+            version=calendar["version"],
+            artifact_uri=calendar.get("artifact_uri"),
+            artifact_sha256=calendar.get("artifact_sha256"),
+            content_fingerprint=calendar.get("content_fingerprint"),
         ),
         coverage=DatasetCoverage(
             start=_parse_utc(coverage["start"], "coverage.start"),
@@ -754,6 +839,55 @@ def validate_dataset_binding(
     )
 
 
+def validate_calendar_binding(
+    manifest: DatasetManifest,
+    calendar: "SessionCalendarArtifact",
+    *,
+    artifact_sha256: str,
+) -> Dict[str, str]:
+    """Bind a v2 manifest to an explicit calendar and its caller-computed file hash."""
+
+    from .session_calendar import SessionCalendarArtifact
+
+    if not isinstance(manifest, DatasetManifest):
+        raise DatasetManifestError("manifest must be a DatasetManifest")
+    if manifest.version != 2:
+        raise DatasetManifestError("calendar binding requires manifest v2")
+    if not isinstance(calendar, SessionCalendarArtifact):
+        raise DatasetManifestError("calendar must be a SessionCalendarArtifact")
+    actual_sha256 = _calendar_sha256(artifact_sha256, "artifact_sha256")
+    reference = manifest.session_calendar
+    if actual_sha256 != reference.artifact_sha256:
+        raise DatasetManifestError("calendar artifact_sha256 does not match the manifest")
+    if calendar.fingerprint != reference.content_fingerprint:
+        raise DatasetManifestError("calendar content_fingerprint does not match the manifest")
+    if calendar.calendar_id != reference.calendar_id:
+        raise DatasetManifestError("calendar id does not match session_calendar.id")
+    if calendar.revision != reference.version:
+        raise DatasetManifestError("calendar revision does not match session_calendar.version")
+    if calendar.provider_name != manifest.provider.name:
+        raise DatasetManifestError("calendar provider_name does not match provider.name")
+    if calendar.provider_legal_entity != manifest.provider.legal_entity:
+        raise DatasetManifestError("calendar provider_legal_entity does not match provider.legal_entity")
+    if calendar.instrument != manifest.instrument.symbol:
+        raise DatasetManifestError("calendar instrument does not match instrument.symbol")
+    if calendar.product_form != manifest.instrument.product_form:
+        raise DatasetManifestError("calendar product_form does not match instrument.product_form")
+    if (
+        calendar.coverage_start > manifest.coverage.start
+        or calendar.coverage_end < manifest.coverage.end
+    ):
+        raise DatasetManifestError("calendar coverage must contain dataset coverage")
+    if calendar.retrieved_at > manifest.source.retrieved_at:
+        raise DatasetManifestError("calendar retrieved_at must not follow source.retrieved_at")
+    return {
+        "calendar_id": calendar.calendar_id,
+        "revision": calendar.revision,
+        "artifact_sha256": actual_sha256,
+        "content_fingerprint": calendar.fingerprint,
+    }
+
+
 def _mapping(value: object, context: str) -> Mapping[str, Any]:
     if not isinstance(value, dict):
         raise DatasetManifestError("{} must be an object".format(context))
@@ -828,10 +962,12 @@ __all__ = [
     "KnownGap",
     "SCHEMA_NAME",
     "SCHEMA_VERSION",
+    "SUPPORTED_VERSIONS",
     "SUPPORTED_INSTRUMENT",
     "SessionCalendar",
     "TimestampConvention",
     "dataset_manifest_from_dict",
     "load_dataset_manifest",
+    "validate_calendar_binding",
     "validate_dataset_binding",
 ]

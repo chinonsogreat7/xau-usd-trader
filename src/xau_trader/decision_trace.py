@@ -17,8 +17,6 @@ from typing import Dict, List, Optional, Tuple, Union
 
 from .candidate_signals import CandidateDecision, CandidatePolicy
 from .diagnostic_replay import (
-    DIAGNOSTIC_REPLAY_ENGINE_VERSION,
-    DIAGNOSTIC_REPLAY_SCHEMA_VERSION,
     DiagnosticReplayResult,
     validate_diagnostic_replay_result,
 )
@@ -32,6 +30,7 @@ from .m15_confirmation import (
 from .market_regime import H1RegimeEvent, RegimePolicy
 from .multitimeframe import H1PivotEvent
 from .research_baseline import ResearchPolicyBundle
+from .session_timing import SESSION_STRATEGY_SEMANTICS, session_semantics
 from .supply_demand import AtrEvent, ImpulseEvent, ImpulsePolicy, ZoneEvent
 from .zone_lifecycle import (
     CompletedBarObservation,
@@ -51,6 +50,7 @@ from .zone_lifecycle import (
 
 TRACE_SCHEMA = "xauusd_diagnostic_trace"
 TRACE_SCHEMA_VERSION = 1
+SESSION_TRACE_SCHEMA_VERSION = 2
 
 
 DECISION_CSV_COLUMNS = (
@@ -99,6 +99,9 @@ DECISION_CSV_COLUMNS = (
 
 
 PathLike = Union[str, os.PathLike]
+SESSION_DECISION_CSV_COLUMNS = DECISION_CSV_COLUMNS + (
+    "calendar_fingerprint", "session_semantics",
+)
 
 
 def _utc(value: datetime) -> str:
@@ -636,7 +639,7 @@ def _action_counts(decisions: Tuple[CandidateDecision, ...]) -> Dict[str, int]:
 
 
 def diagnostic_trace_dict(result: DiagnosticReplayResult) -> Dict[str, object]:
-    """Return the complete schema-v1 trace as JSON-compatible primitives."""
+    """Return a strict-v1 or calendar-bound-v2 trace as JSON primitives."""
 
     if not isinstance(result, DiagnosticReplayResult):
         raise TypeError("result must be a DiagnosticReplayResult")
@@ -662,17 +665,18 @@ def diagnostic_trace_dict(result: DiagnosticReplayResult) -> Dict[str, object]:
         "pre_roll_actions": _action_counts(result.pre_roll_decisions),
         "post_pre_roll_actions": _action_counts(result.post_pre_roll_decisions),
     }
-    return {
+    trace = {
         "schema": TRACE_SCHEMA,
-        "schema_version": TRACE_SCHEMA_VERSION,
+        "schema_version": (TRACE_SCHEMA_VERSION if result.calendar is None
+                           else SESSION_TRACE_SCHEMA_VERSION),
         "diagnostic_only": True,
         "execution": None,
         "dataset": {"fingerprint": result.dataset_fingerprint},
         "replay": {
             "fingerprint": result.fingerprint,
             "evidence_fingerprint": result.evidence_fingerprint,
-            "engine_version": DIAGNOSTIC_REPLAY_ENGINE_VERSION,
-            "schema_version": DIAGNOSTIC_REPLAY_SCHEMA_VERSION,
+            "engine_version": result.engine_version,
+            "schema_version": result.schema_version,
             "input_bars_fingerprint": result.input_bars_fingerprint,
             "policy_bundle_fingerprint": result.policy_bundle_fingerprint,
             "as_of": _optional_utc(result.as_of),
@@ -701,6 +705,13 @@ def diagnostic_trace_dict(result: DiagnosticReplayResult) -> Dict[str, object]:
         "lifecycle": _lifecycle(result.lifecycle),
         "decisions": [_decision(result, event) for event in result.decisions],
     }
+    if result.calendar is not None:
+        trace["session"] = {
+            "calendar_fingerprint": result.calendar.fingerprint,
+            "calendar": result.calendar.as_dict(),
+            "semantics": session_semantics(),
+        }
+    return trace
 
 
 def diagnostic_trace_json_bytes(result: DiagnosticReplayResult) -> bytes:
@@ -737,15 +748,16 @@ def _csv_row(
 ) -> Dict[str, object]:
     confirmation = event.confirmation
     regime = event.regime
-    return {
+    row = {
         "schema": TRACE_SCHEMA,
-        "schema_version": TRACE_SCHEMA_VERSION,
+        "schema_version": (TRACE_SCHEMA_VERSION if result.calendar is None
+                           else SESSION_TRACE_SCHEMA_VERSION),
         "diagnostic_only": "true",
         "execution": "",
         "dataset_fingerprint": result.dataset_fingerprint,
         "replay_fingerprint": replay_fingerprint,
-        "replay_engine_version": DIAGNOSTIC_REPLAY_ENGINE_VERSION,
-        "replay_schema_version": DIAGNOSTIC_REPLAY_SCHEMA_VERSION,
+        "replay_engine_version": result.engine_version,
+        "replay_schema_version": result.schema_version,
         "evidence_fingerprint": evidence_fingerprint,
         "input_bars_fingerprint": result.input_bars_fingerprint,
         "policy_bundle_fingerprint": result.policy_bundle_fingerprint,
@@ -788,6 +800,10 @@ def _csv_row(
         "regime_policy_fingerprint": event.regime_policy_fingerprint,
         "confirmation_policy_fingerprint": event.confirmation_policy_fingerprint,
     }
+    if result.calendar is not None:
+        row["calendar_fingerprint"] = result.calendar.fingerprint
+        row["session_semantics"] = SESSION_STRATEGY_SEMANTICS
+    return row
 
 
 def diagnostic_decisions_csv_bytes(result: DiagnosticReplayResult) -> bytes:
@@ -799,7 +815,8 @@ def diagnostic_decisions_csv_bytes(result: DiagnosticReplayResult) -> bytes:
     output = io.StringIO(newline="")
     writer = csv.DictWriter(
         output,
-        fieldnames=DECISION_CSV_COLUMNS,
+        fieldnames=(DECISION_CSV_COLUMNS if result.calendar is None
+                    else SESSION_DECISION_CSV_COLUMNS),
         extrasaction="raise",
         lineterminator="\n",
     )
@@ -966,6 +983,8 @@ def write_diagnostic_trace_artifacts(
 
 __all__ = [
     "DECISION_CSV_COLUMNS",
+    "SESSION_DECISION_CSV_COLUMNS",
+    "SESSION_TRACE_SCHEMA_VERSION",
     "TRACE_SCHEMA",
     "TRACE_SCHEMA_VERSION",
     "diagnostic_decisions_csv_bytes",

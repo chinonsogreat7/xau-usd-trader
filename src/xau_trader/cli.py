@@ -1,6 +1,8 @@
 """Command-line entry points for validation and deterministic research demos."""
 
 import argparse
+from decimal import Decimal, InvalidOperation
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -33,20 +35,34 @@ from .dataset_manifest import (
     SessionCalendar,
     TimestampConvention,
     load_dataset_manifest,
+    validate_calendar_binding,
     validate_dataset_binding,
 )
 from .decision_trace import write_diagnostic_trace_artifacts
 from .diagnostic_replay import (
-    DIAGNOSTIC_REPLAY_ENGINE_VERSION,
-    DIAGNOSTIC_REPLAY_SCHEMA_VERSION,
     run_diagnostic_replay,
 )
 from .domain import QuoteBar
-from .research_baseline import provisional_diagnostic_baseline_v1
+from .mt5_import import import_mt5_tick_file
+from .mt5_session_import import import_mt5_session_tick_file
+from .local_demo import run_local_paper_demo
+from .paper_execution import PaperLossLimits
+from .paper_execution_io import (
+    load_paper_scenario, parse_paper_scenario, run_paper_scenario,
+    synthetic_execution_scenario, write_new_json,
+)
+from .research_baseline import (
+    provisional_diagnostic_baseline_v1, provisional_session_diagnostic_baseline_v1,
+)
+from .replay_preflight import inspect_replay_bars
 from .risk import RiskEngine, RiskPolicy
+from .session_calendar import load_session_calendar
+from .session_features import run_session_feature_replay
+from .session_timing import session_semantics
 from .strategy_compiler import compile_strategy_spec_v1
 from .strategy_schema import parse_strategy_spec_json, validate_strategy_spec_v1
 from .strategies import SmaCrossStrategy
+from .structural_exits import StructuralExitPolicy
 
 
 def _add_backtest_options(parser: argparse.ArgumentParser) -> None:
@@ -70,12 +86,56 @@ def _add_backtest_options(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _finite_decimal_argument(value: str) -> Decimal:
+    try:
+        converted = Decimal(value)
+    except InvalidOperation as error:
+        raise argparse.ArgumentTypeError("must be a finite decimal") from error
+    if not converted.is_finite():
+        raise argparse.ArgumentTypeError("must be a finite decimal")
+    return converted
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="xau-trader",
         description="Paper-only XAU/USD strategy research scaffold",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    local_demo = subparsers.add_parser(
+        "run-paper-demo", help="run a readable offline demo and save a new report folder automatically",
+    )
+    local_demo.add_argument("--output-root", type=Path, default=Path("reports"))
+
+    paper_demo = subparsers.add_parser(
+        "demo-paper-execution", help="simulate scripted synthetic bracket trades; no broker connection",
+    )
+    paper_demo.add_argument("--report-json", type=Path, required=True)
+    paper_export = subparsers.add_parser(
+        "export-paper-scenario", help="export the editable synthetic bracket-test scenario",
+    )
+    paper_export.add_argument("destination", type=Path)
+    paper_export.add_argument("--max-losses-per-day", type=int)
+    paper_export.add_argument("--max-weekly-drawdown-fraction", type=_finite_decimal_argument)
+    paper_run = subparsers.add_parser(
+        "simulate-paper", help="simulate a strict synthetic quote/intent scenario; no broker connection",
+    )
+    paper_run.add_argument("scenario", type=Path)
+    paper_run.add_argument("--report-json", type=Path, required=True)
+
+    strategy_paper = subparsers.add_parser(
+        "replay-strategy-paper",
+        help="bind provisional strategy signals to synthetic quotes; strict manifest v1 only, no broker",
+    )
+    strategy_paper.add_argument("csv", type=Path)
+    strategy_paper.add_argument("--manifest", type=Path, required=True)
+    strategy_paper.add_argument("--quote-scenario", type=Path, required=True)
+    strategy_paper.add_argument("--raw-data", type=Path)
+    strategy_paper.add_argument("--m15-left-wing", type=int, required=True)
+    strategy_paper.add_argument("--m15-right-wing", type=int, required=True)
+    strategy_paper.add_argument("--stop-atr-multiple", type=_finite_decimal_argument, required=True)
+    strategy_paper.add_argument("--report-json", type=Path, required=True)
 
     demo = subparsers.add_parser("demo", help="run the baseline on deterministic fake data")
     demo.add_argument("--bars", type=int, default=480)
@@ -88,6 +148,36 @@ def build_parser() -> argparse.ArgumentParser:
     validate = subparsers.add_parser("validate-data", help="validate a bid/ask CSV")
     validate.add_argument("csv", type=Path)
     validate.add_argument("--expected-minutes", type=float, default=60.0)
+
+    preflight = subparsers.add_parser(
+        "check-replay-data",
+        help="inspect M15 replay compatibility and input provenance without running a replay",
+    )
+    preflight.add_argument("csv", type=Path)
+    preflight.add_argument("--manifest", type=Path)
+    preflight.add_argument(
+        "--raw-data", type=Path,
+        help="exact source artifact before normalization; requires --manifest",
+    )
+
+    tick_import = subparsers.add_parser(
+        "import-mt5-ticks", help="normalize a local complete-quote MT5 tick export; no trading",
+    )
+    tick_import.add_argument("raw", type=Path)
+    tick_import.add_argument("--plan", type=Path, required=True)
+    tick_import.add_argument("--calendar", type=Path, required=True)
+    tick_import.add_argument("--output-csv", type=Path, required=True)
+    tick_import.add_argument("--manifest", type=Path, required=True)
+    tick_import.add_argument("--report-json", type=Path, required=True)
+
+    session_tick_import = subparsers.add_parser(
+        "import-mt5-session-ticks",
+        help="preserve MT5 ticks with partial-session diagnostics; no strategy or trading",
+    )
+    session_tick_import.add_argument("raw", type=Path)
+    session_tick_import.add_argument("--plan", type=Path, required=True)
+    session_tick_import.add_argument("--calendar", type=Path, required=True)
+    session_tick_import.add_argument("--output-json", type=Path, required=True)
 
     export = subparsers.add_parser("export-demo-data", help="write deterministic fake CSV data")
     export.add_argument("destination", type=Path)
@@ -127,6 +217,27 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="replace existing trace outputs",
     )
+
+    session_replay = subparsers.add_parser(
+        "replay-session-features",
+        help="replay calendar-bound H1/ATR/pivot/EMA features only; no trade signals",
+    )
+    session_replay.add_argument("csv", type=Path)
+    session_replay.add_argument("--manifest", type=Path, required=True)
+    session_replay.add_argument("--calendar", type=Path, required=True)
+    session_replay.add_argument("--raw-data", type=Path)
+    session_replay.add_argument("--trace-json", type=Path, required=True)
+
+    session_strategy = subparsers.add_parser(
+        "replay-session-diagnostic",
+        help="replay the provisional calendar-bound strategy; research candidates only, no orders",
+    )
+    session_strategy.add_argument("csv", type=Path)
+    session_strategy.add_argument("--manifest", type=Path, required=True)
+    session_strategy.add_argument("--calendar", type=Path, required=True)
+    session_strategy.add_argument("--raw-data", type=Path)
+    session_strategy.add_argument("--trace-json", type=Path, required=True)
+    session_strategy.add_argument("--decisions-csv", type=Path, required=True)
 
     validate_strategy = subparsers.add_parser(
         "validate-strategy",
@@ -318,6 +429,266 @@ def _decision_counts(decisions: Sequence[object]) -> dict:
     return counts
 
 
+def _load_replay_snapshot(
+    csv_path: Path,
+    manifest_path: Optional[Path] = None,
+    raw_path: Optional[Path] = None,
+) -> tuple:
+    """Read the same input snapshot for preflight and replay, checking for changes."""
+
+    raw_path = csv_path if raw_path is None else raw_path
+    same_raw = _resolved(raw_path) == _resolved(csv_path)
+    manifest_before = None if manifest_path is None else sha256_file(manifest_path)
+    normalized_before = sha256_file(csv_path)
+    raw_before = normalized_before if same_raw else sha256_file(raw_path)
+    manifest = None if manifest_path is None else load_dataset_manifest(manifest_path)
+    bars = read_quote_bars_csv(csv_path)
+    manifest_after = None if manifest_path is None else sha256_file(manifest_path)
+    normalized_after = sha256_file(csv_path)
+    raw_after = (
+        normalized_after
+        if _resolved(raw_path) == _resolved(csv_path)
+        else sha256_file(raw_path)
+    )
+    if manifest_before != manifest_after:
+        raise ValueError("manifest changed while it was being read")
+    if normalized_before != normalized_after:
+        raise ValueError("normalized CSV changed while it was being read")
+    if raw_before != raw_after:
+        raise ValueError("raw data changed while inputs were being read")
+    return bars, manifest, normalized_before, raw_before
+
+
+def _check_replay_data(args: argparse.Namespace) -> dict:
+    if args.raw_data is not None and args.manifest is None:
+        raise ValueError("--raw-data requires --manifest")
+    bars, manifest, csv_hash, raw_hash = _load_replay_snapshot(
+        args.csv, args.manifest, args.raw_data,
+    )
+    technical = inspect_replay_bars(bars, provisional_diagnostic_baseline_v1())
+    provenance = {"status": "missing_manifest"}
+    inputs_ready = False
+    if manifest is not None:
+        if manifest.version != 1:
+            raise ValueError(
+                "check-replay-data assesses strict v1 strategy inputs; "
+                "use replay-session-features or replay-session-diagnostic with --calendar for manifest v2"
+            )
+        binding = validate_dataset_binding(
+            manifest, bars, raw_sha256=raw_hash, normalized_csv_sha256=csv_hash,
+        )
+        provenance = {
+            "status": "binding_valid",
+            "manifest_identity": binding.manifest_identity,
+            "manifest_fingerprint": binding.manifest_fingerprint,
+            "raw_sha256": raw_hash,
+            "known_gap_count": binding.known_gap_count,
+            "rights_claims_independently_verified": False,
+        }
+        inputs_ready = technical["compatible"] and binding.known_gap_count == 0
+    return {
+        "status": "replay_inputs_ready" if inputs_ready else "replay_inputs_blocked",
+        "ready_for_diagnostic_replay": inputs_ready,
+        "diagnostic_only": True,
+        "csv": {"path": str(args.csv), "sha256": csv_hash},
+        "technical": technical,
+        "provenance": provenance,
+        "notes": [
+            "This check inspects inputs; it does not run the strategy or calculate returns.",
+            "Manifest binding checks recorded claims and hashes, not permission to use the data.",
+            "Segment counts do not remove gaps, create candles, or approve a shortened history.",
+        ],
+    }
+
+
+def _load_session_snapshot(args: argparse.Namespace) -> tuple:
+    inputs = (args.csv, args.manifest, args.calendar, args.raw_data or args.csv)
+    # Enclose all four input reads in a common before/after hash check. Calendar
+    # URIs in the manifest are metadata only: never fetch them over the network.
+    before = tuple(sha256_file(path) for path in inputs)
+    bars, manifest, csv_hash, raw_hash = _load_replay_snapshot(
+        args.csv, args.manifest, args.raw_data,
+    )
+    calendar = load_session_calendar(args.calendar)
+    after = tuple(sha256_file(path) for path in inputs)
+    if before != after or csv_hash != before[0] or raw_hash != before[3]:
+        raise ValueError("session replay inputs changed while they were being read")
+    binding = validate_dataset_binding(
+        manifest, bars, raw_sha256=raw_hash, normalized_csv_sha256=csv_hash,
+    )
+    calendar_binding = validate_calendar_binding(
+        manifest, calendar, artifact_sha256=before[2],
+    )
+    return bars, manifest, calendar, binding, calendar_binding
+
+
+def _replay_strategy_paper(args: argparse.Namespace) -> dict:
+    """Publish a fully bound, synthetic-only strategy/execution experiment."""
+    from .strategy_paper import run_strategy_paper_replay
+
+    raw_path = args.raw_data or args.csv
+    inputs = (args.csv, args.manifest, raw_path, args.quote_scenario)
+    _require_distinct_outputs((args.report_json,), inputs)
+    if args.report_json.exists() or args.report_json.is_symlink():
+        raise FileExistsError("output already exists: {}".format(args.report_json))
+    structural_policy = StructuralExitPolicy(
+        m15_left_wing=args.m15_left_wing,
+        m15_right_wing=args.m15_right_wing,
+        stop_atr_multiple=args.stop_atr_multiple,
+    )
+    before = tuple(sha256_file(path) for path in inputs)
+    bars, manifest, csv_hash, raw_hash = _load_replay_snapshot(
+        args.csv, args.manifest, raw_path,
+    )
+    scenario = load_paper_scenario(args.quote_scenario)
+    after = tuple(sha256_file(path) for path in inputs)
+    if (before != after or csv_hash != before[0] or raw_hash != before[2]
+            or scenario.input_sha256 != before[3]):
+        raise ValueError("strategy paper inputs changed while they were being read")
+    if manifest.version != 1:
+        raise ValueError(
+            "replay-strategy-paper supports strict continuous synthetic manifest v1 only; "
+            "calendar-bound manifest v2 execution is not supported"
+        )
+    if manifest.source.acquisition_basis != AcquisitionBasis.SYNTHETIC_GENERATION:
+        raise ValueError("replay-strategy-paper requires a synthetic_generation manifest")
+    if manifest.instrument.symbol != scenario.instrument.symbol:
+        raise ValueError("manifest symbol must match the paper instrument")
+    if scenario.intents:
+        raise ValueError(
+            "quote scenario intents must be empty; this command derives all intents from the strategy"
+        )
+    binding = validate_dataset_binding(
+        manifest, bars, raw_sha256=raw_hash, normalized_csv_sha256=csv_hash,
+    )
+    if binding.known_gap_count:
+        raise ValueError("strategy paper replay does not support declared dataset gaps")
+    replay = run_diagnostic_replay(
+        bars, dataset_fingerprint=binding.manifest_fingerprint,
+        policy_bundle=provisional_diagnostic_baseline_v1(),
+    )
+    result = run_strategy_paper_replay(
+        replay, quotes=scenario.quotes, instrument=scenario.instrument,
+        execution_policy=scenario.policy, structural_policy=structural_policy,
+        loss_limits=scenario.loss_limits,
+    ).as_dict()
+    report = {
+        "schema": "xau-strategy-paper-replay-report",
+        "version": 1,
+        "status": result["status"],
+        "data_basis": "synthetic",
+        "broker_connected": False,
+        "real_orders_submitted": 0,
+        "promotion_eligible": False,
+        "hypothesis_unapproved": result["hypothesis_unapproved"],
+        "source_risk_policy_complete": result["source_risk_policy_complete"],
+        "loss_limits_configured": result["loss_limits_configured"],
+        "loss_limits": result["loss_limits"],
+        "dataset": {
+            "manifest_identity": binding.manifest_identity,
+            "manifest_fingerprint": binding.manifest_fingerprint,
+            "manifest_input_sha256": before[1],
+            "manifest": json.loads(manifest.canonical_json),
+            "raw_sha256": raw_hash,
+            "normalized_csv_sha256": csv_hash,
+            "row_count": binding.row_count,
+            "known_gap_count": binding.known_gap_count,
+            "rights_claims_independently_verified": False,
+        },
+        "quote_scenario": {
+            "name": scenario.name,
+            "input_sha256": scenario.input_sha256,
+            "canonical_sha256": hashlib.sha256(scenario.canonical_json.encode("utf-8")).hexdigest(),
+            "inputs": json.loads(scenario.canonical_json),
+            "hand_scripted_intents_accepted": False,
+        },
+        "strategy_execution": result,
+        "warning": (
+            "Synthetic prices and provisional unapproved strategy rules test integration mechanics only. "
+            "This is not a broker account result, live runner, or evidence of profitability. "
+            "Historical data and calendar-bound execution are not supported by this command."
+        ),
+    }
+    report["fingerprint"] = hashlib.sha256(json.dumps(
+        report, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ).encode("utf-8")).hexdigest()
+    write_new_json(args.report_json, report)
+    return {
+        "status": report["status"],
+        "data_basis": "synthetic",
+        "broker_connected": False,
+        "real_orders_submitted": 0,
+        "promotion_eligible": False,
+        "hypothesis_unapproved": report["hypothesis_unapproved"],
+        "source_risk_policy_complete": report["source_risk_policy_complete"],
+        "loss_limits_configured": report["loss_limits_configured"],
+        "counts": result["counts"],
+        "fingerprint": report["fingerprint"],
+        "report_json": str(args.report_json),
+        "warning": report["warning"],
+    }
+
+
+def _session_output_preflight(args: argparse.Namespace, outputs: Sequence[Path]) -> None:
+    inputs = (args.csv, args.manifest, args.calendar, args.raw_data or args.csv)
+    _require_distinct_outputs(outputs, inputs)
+    for target in outputs:
+        if target.exists() or target.is_symlink():
+            raise FileExistsError("output already exists: {}".format(target))
+
+
+def _replay_session_features(args: argparse.Namespace) -> dict:
+    _session_output_preflight(args, (args.trace_json,))
+    bars, manifest, calendar, binding, calendar_binding = _load_session_snapshot(args)
+    report = run_session_feature_replay(
+        bars, calendar=calendar, policy_bundle=provisional_diagnostic_baseline_v1(),
+        dataset_fingerprint=binding.manifest_fingerprint,
+    )
+    # Serialize completely before creating anything; publish exclusively so an
+    # existing artifact (including a late collision) can never be overwritten.
+    payload = json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    args.trace_json.parent.mkdir(parents=True, exist_ok=True)
+    staged = _staging_path(args.trace_json)
+    try:
+        staged.write_text(payload, encoding="utf-8")
+        os.link(str(staged), str(args.trace_json))
+    finally:
+        _discard_staging(staged)
+    return {
+        "status": report["status"], "diagnostic_only": True, "execution": None,
+        "strategy_candidates_generated": False, "full_strategy_replay_supported": False,
+        "manifest_identity": binding.manifest_identity,
+        "calendar_binding": calendar_binding,
+        "fingerprint": report["fingerprint"], "counts": report["counts"],
+        "warmup": report["warmup"], "trace_json": str(args.trace_json),
+        "warnings": report["warnings"],
+    }
+
+
+def _replay_session_diagnostic(args: argparse.Namespace) -> dict:
+    _session_output_preflight(args, (args.trace_json, args.decisions_csv))
+    bars, manifest, calendar, binding, calendar_binding = _load_session_snapshot(args)
+    result = run_diagnostic_replay(
+        bars, dataset_fingerprint=binding.manifest_fingerprint,
+        policy_bundle=provisional_session_diagnostic_baseline_v1(calendar),
+    )
+    args.trace_json.parent.mkdir(parents=True, exist_ok=True)
+    args.decisions_csv.parent.mkdir(parents=True, exist_ok=True)
+    outputs = write_diagnostic_trace_artifacts(
+        result, args.trace_json, args.decisions_csv, overwrite=False,
+    )
+    summary = _replay_summary(result, binding, manifest, outputs)
+    summary["status"] = "session_diagnostic_replay_complete"
+    summary["session"] = {
+        "calendar_binding": calendar_binding, "semantics": session_semantics(),
+    }
+    summary["warnings"].extend((
+        "Closure behavior is a named provisional hypothesis, not a verified broker rule.",
+        "Calendar hashes verify recorded evidence, not its truth or data-use rights.",
+    ))
+    return summary
+
+
 def _replay_summary(result, binding, manifest: DatasetManifest, outputs: Sequence[Path]) -> dict:
     all_action_counts = _decision_counts(result.decisions)
     post_pre_roll_action_counts = _decision_counts(result.post_pre_roll_decisions)
@@ -357,8 +728,8 @@ def _replay_summary(result, binding, manifest: DatasetManifest, outputs: Sequenc
         "replay": {
             "fingerprint": result.fingerprint,
             "evidence_fingerprint": result.evidence_fingerprint,
-            "engine_version": DIAGNOSTIC_REPLAY_ENGINE_VERSION,
-            "schema_version": DIAGNOSTIC_REPLAY_SCHEMA_VERSION,
+            "engine_version": result.engine_version,
+            "schema_version": result.schema_version,
             "input_bars_fingerprint": result.input_bars_fingerprint,
             "policy_bundle_fingerprint": result.policy_bundle_fingerprint,
             "readiness": {
@@ -396,6 +767,75 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        if args.command == "run-paper-demo":
+            _, summary = run_local_paper_demo(args.output_root)
+            print(summary, end="")
+            return 0
+
+        if args.command == "export-paper-scenario":
+            fixture = synthetic_execution_scenario()
+            configured = args.max_losses_per_day is not None
+            if configured != (args.max_weekly_drawdown_fraction is not None):
+                raise ValueError("provide both --max-losses-per-day and --max-weekly-drawdown-fraction")
+            if configured:
+                limits = PaperLossLimits(args.max_losses_per_day, args.max_weekly_drawdown_fraction)
+                fixture.update(version=2, loss_limits=dict(
+                    max_losses_per_day=limits.max_losses_per_day,
+                    max_weekly_drawdown_fraction=format(limits.max_weekly_drawdown_fraction, "f"),
+                ))
+                parse_paper_scenario(json.dumps(fixture).encode("utf-8"))
+            write_new_json(args.destination, fixture)
+            print(json.dumps({
+                "status": "synthetic_paper_scenario_exported", "path": str(args.destination),
+                "broker_connected": False,
+                "loss_limits_configured": configured,
+                "warning": "Scripted execution fixture only; not a strategy or Exness specification.",
+            }, indent=2, sort_keys=True))
+            return 0
+
+        if args.command in ("demo-paper-execution", "simulate-paper"):
+            if args.command == "simulate-paper":
+                _require_distinct_outputs((args.report_json,), (args.scenario,))
+                scenario = load_paper_scenario(args.scenario)
+            else:
+                scenario = parse_paper_scenario(json.dumps(synthetic_execution_scenario()).encode("utf-8"))
+            report = run_paper_scenario(scenario)
+            write_new_json(args.report_json, report)
+            summary_keys = (
+                "status", "engine_version", "broker_connected", "real_orders_submitted",
+                "promotion_eligible", "counts", "initial_balance", "final_balance",
+                "final_equity", "net_pnl", "total_commission", "total_financing", "warning",
+                "loss_limits",
+            )
+            summary = {key: report[key] for key in summary_keys}
+            summary.update({key: report[key] for key in ("losses_today", "loss_count_halt", "weekly_halt")
+                            if key in report})
+            summary["report_json"] = str(args.report_json)
+            print(json.dumps(summary, indent=2, sort_keys=True, allow_nan=False))
+            return 0
+
+        if args.command == "replay-strategy-paper":
+            summary = _replay_strategy_paper(args)
+            print(json.dumps(summary, indent=2, sort_keys=True, allow_nan=False))
+            return 0
+
+        if args.command == "import-mt5-ticks":
+            report = import_mt5_tick_file(
+                args.raw, plan_path=args.plan, calendar_path=args.calendar,
+                output_csv=args.output_csv, output_manifest=args.manifest,
+                report_json=args.report_json,
+            )
+            print(json.dumps(report, indent=2, sort_keys=True, allow_nan=False))
+            return 0
+
+        if args.command == "import-mt5-session-ticks":
+            report = import_mt5_session_tick_file(
+                args.raw, plan_path=args.plan, calendar_path=args.calendar,
+                output_json=args.output_json,
+            )
+            print(json.dumps(report, indent=2, sort_keys=True, allow_nan=False))
+            return 0
+
         if args.command == "demo":
             summary = _run_backtest(args, generate_demo_bars(args.bars))
             summary["data"] = "deterministic synthetic demonstration data"
@@ -423,6 +863,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "warning": "Cadence gaps require a versioned broker session calendar.",
             }
             print(json.dumps(report, indent=2, sort_keys=True))
+            return 0
+
+        if args.command == "check-replay-data":
+            report = _check_replay_data(args)
+            print(json.dumps(report, indent=2, sort_keys=True, allow_nan=False))
+            return 0 if report["ready_for_diagnostic_replay"] else 1
+
+        if args.command == "replay-session-features":
+            report = _replay_session_features(args)
+            print(json.dumps(report, indent=2, sort_keys=True, allow_nan=False))
+            return 0
+
+        if args.command == "replay-session-diagnostic":
+            report = _replay_session_diagnostic(args)
+            print(json.dumps(report, indent=2, sort_keys=True, allow_nan=False))
             return 0
 
         if args.command == "export-demo-data":
@@ -493,28 +948,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 (args.csv, args.manifest, raw_path),
             )
 
-            manifest_bytes_before = sha256_file(args.manifest)
-            normalized_before = sha256_file(args.csv)
-            raw_before = (
-                normalized_before
-                if _resolved(raw_path) == _resolved(args.csv)
-                else sha256_file(raw_path)
+            bars, manifest, normalized_before, raw_before = _load_replay_snapshot(
+                args.csv, args.manifest, raw_path,
             )
-            manifest = load_dataset_manifest(args.manifest)
-            bars = read_quote_bars_csv(args.csv)
-            manifest_bytes_after = sha256_file(args.manifest)
-            normalized_after = sha256_file(args.csv)
-            raw_after = (
-                normalized_after
-                if _resolved(raw_path) == _resolved(args.csv)
-                else sha256_file(raw_path)
-            )
-            if manifest_bytes_before != manifest_bytes_after:
-                raise ValueError("manifest changed while it was being read")
-            if normalized_before != normalized_after:
-                raise ValueError("normalized CSV changed while it was being read")
-            if raw_before != raw_after:
-                raise ValueError("raw data changed while inputs were being read")
+
+            if manifest.version != 1:
+                raise ValueError(
+                    "replay-diagnostic supports strict manifest v1 only; "
+                    "use replay-session-features or replay-session-diagnostic with --calendar for manifest v2"
+                )
 
             binding = validate_dataset_binding(
                 manifest,

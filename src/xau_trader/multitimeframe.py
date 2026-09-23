@@ -12,6 +12,7 @@ import math
 from typing import Iterable, Optional, Sequence, Tuple
 
 from .domain import AvailabilityBasis, QuoteBar
+from .session_calendar import SessionCalendarArtifact
 
 
 M15_DURATION = timedelta(minutes=15)
@@ -62,7 +63,12 @@ def _validate_bars(
     duration: timedelta,
     label: str,
     require_hour_boundary: bool,
+    calendar: Optional[SessionCalendarArtifact] = None,
 ) -> None:
+    if calendar is not None:
+        if not isinstance(calendar, SessionCalendarArtifact):
+            raise TypeError("calendar must be a SessionCalendarArtifact")
+        calendar.require_hour_aligned_closures()
     for index, bar in enumerate(bars):
         if not isinstance(bar, QuoteBar):
             raise TypeError("{} input must contain QuoteBar values".format(label))
@@ -89,7 +95,11 @@ def _validate_bars(
                     label, index, "hour" if require_hour_boundary else "15-minute"
                 )
             )
-        if index and bar.start_time != bars[index - 1].timestamp:
+        if calendar is not None:
+            calendar.validate_bar(bar.start_time, bar.timestamp)
+            if index:
+                calendar.validate_transition(bars[index - 1].timestamp, bar.start_time)
+        elif index and bar.start_time != bars[index - 1].timestamp:
             raise MultiTimeframeDataError(
                 "{} bar {} is not contiguous with the previous bar".format(label, index)
             )
@@ -101,24 +111,33 @@ def _availability_gate(bars: Sequence[QuoteBar]) -> QuoteBar:
     return max(enumerate(bars), key=lambda item: (item[1].available_at, item[0]))[1]
 
 
-def aggregate_m15_to_h1(bars: Iterable[QuoteBar]) -> Tuple[QuoteBar, ...]:
+def aggregate_m15_to_h1(
+    bars: Iterable[QuoteBar],
+    *,
+    calendar: Optional[SessionCalendarArtifact] = None,
+) -> Tuple[QuoteBar, ...]:
     """Aggregate complete contiguous UTC M15 bars into immutable H1 bars.
 
     The function fails closed for partial hours, gaps, overlaps, bad durations, or
     inconsistent UTC boundaries.  H1 availability is the maximum child
     ``available_at``.  Volume is summed only when all four child volumes exist;
     otherwise it remains unknown.
+
+    An explicit calendar permits only documented full-hour closures for feature
+    diagnostics.  Real timestamps remain intact, and no bars are synthesized.
+    Omitting the calendar preserves strict contiguous-input behavior.
     """
 
     source = tuple(bars)
-    if not source:
-        return ()
     _validate_bars(
         source,
         duration=M15_DURATION,
         label="M15",
         require_hour_boundary=False,
+        calendar=calendar,
     )
+    if not source:
+        return ()
     if not _is_boundary(source[0].start_time, 0):
         raise MultiTimeframeDataError("M15 input must begin on a UTC hour boundary")
     if not _is_boundary(source[-1].timestamp, 0):
@@ -191,13 +210,19 @@ def _pivot_event(
 
 
 def confirmed_h1_pivots(
-    bars: Iterable[QuoteBar], *, as_of: Optional[datetime] = None
+    bars: Iterable[QuoteBar],
+    *,
+    as_of: Optional[datetime] = None,
+    calendar: Optional[SessionCalendarArtifact] = None,
 ) -> Tuple[H1PivotEvent, ...]:
     """Return strict 3-left/3-right H1 pivots in deterministic time order.
 
     Highs and lows are compared on the arithmetic mid of the matching bid/ask
     extremes.  Equality with any wing bar disqualifies the pivot.  Supplying
     ``as_of`` returns only events actually available by that timezone-aware time.
+    An explicit calendar enables feature diagnostics across documented full-hour
+    closures.  Wings count actual bars; confirmation keeps the third right-wing
+    bar's real close time.  Downstream strategy joins remain strictly contiguous.
     """
 
     source = tuple(bars)
@@ -205,14 +230,15 @@ def confirmed_h1_pivots(
         if as_of.tzinfo is None or as_of.utcoffset() is None:
             raise ValueError("as_of must include a timezone")
         as_of = as_of.astimezone(timezone.utc)
-    if not source:
-        return ()
     _validate_bars(
         source,
         duration=H1_DURATION,
         label="H1",
         require_hour_boundary=True,
+        calendar=calendar,
     )
+    if not source:
+        return ()
     events = []
     window_size = PIVOT_LEFT_WING + 1 + PIVOT_RIGHT_WING
     for start in range(0, len(source) - window_size + 1):

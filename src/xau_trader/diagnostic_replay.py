@@ -1,11 +1,15 @@
 """End-to-end, paper-only diagnostic replay for the XAU/USD hypothesis.
 
 The replay is deliberately a composition boundary rather than an execution
-engine.  It accepts one contiguous M15 bid/ask stream and one fully explicit
+engine.  It accepts one M15 bid/ask stream and one fully explicit
 research-policy bundle, derives every upstream evidence stream, folds sealed
 H1/M15 receipt groups through the zone lifecycle, and finishes at auditable
 ``BUY``/``SELL``/``NO_TRADE`` candidates.  It has no broker, order, fill,
 position, stop, target, account, P&L, or profitability behavior.
+
+The original policy requires strict contiguity. A separately named session
+policy binds an explicit finite calendar and provisional closure semantics;
+only exactly declared closures may interrupt the actual source bars.
 
 ``dataset_fingerprint`` must be the validated sidecar manifest fingerprint at
 the CLI boundary. ``input_bars_fingerprint`` independently binds the exact
@@ -45,6 +49,8 @@ from .multitimeframe import (
     confirmed_h1_pivots,
 )
 from .research_baseline import ResearchPolicyBundle
+from .session_calendar import SessionCalendarArtifact
+from .session_timing import validate_calendar
 from .supply_demand import (
     IMPULSE_WINDOW_BARS,
     AtrEvent,
@@ -74,6 +80,8 @@ class DiagnosticReplayDataError(ValueError):
 
 DIAGNOSTIC_REPLAY_ENGINE_VERSION = "xauusd-diagnostic-replay-engine-v2"
 DIAGNOSTIC_REPLAY_SCHEMA_VERSION = 2
+SESSION_DIAGNOSTIC_REPLAY_ENGINE_VERSION = "xauusd-session-diagnostic-replay-engine-v1"
+SESSION_DIAGNOSTIC_REPLAY_SCHEMA_VERSION = 3
 
 
 class ReplayHistoryBoundary(str, Enum):
@@ -173,6 +181,9 @@ def _stable_encode(value: object) -> bytes:
         ).encode("utf-8")
         payload = [_frame(b"t", identity)]
         for item in fields(value):
+            # Optional calendar support must not rewrite strict-v1 identities.
+            if item.name == "calendar" and getattr(value, item.name) is None:
+                continue
             payload.append(_frame(b"k", item.name.encode("utf-8")))
             payload.append(_stable_encode(getattr(value, item.name)))
         return _frame(b"c", b"".join(payload))
@@ -248,7 +259,10 @@ def _visible_prefix(
     return tuple(bars[:first_hidden])
 
 
-def _validate_m15_bars(bars: Sequence[QuoteBar]) -> AvailabilityBasis:
+def _validate_m15_bars(
+    bars: Sequence[QuoteBar], calendar: Optional[SessionCalendarArtifact] = None,
+) -> AvailabilityBasis:
+    validate_calendar(calendar)
     if not bars:
         raise DiagnosticReplayDataError("M15 input is empty at the replay cutoff")
     for index, bar in enumerate(bars):
@@ -268,7 +282,11 @@ def _validate_m15_bars(bars: Sequence[QuoteBar]) -> AvailabilityBasis:
             raise DiagnosticReplayDataError(
                 "M15 bar {} is not aligned to a UTC 15-minute boundary".format(index)
             )
-        if index and bar.start_time != bars[index - 1].timestamp:
+        if calendar is not None:
+            calendar.validate_bar(bar.start_time, bar.timestamp)
+            if index:
+                calendar.validate_transition(bars[index - 1].timestamp, bar.start_time)
+        elif index and bar.start_time != bars[index - 1].timestamp:
             raise DiagnosticReplayDataError(
                 "M15 bar {} is not contiguous with the previous bar".format(index)
             )
@@ -401,6 +419,7 @@ def _availability_groups(
     m15_bars: Sequence[QuoteBar],
     h1_bars: Sequence[QuoteBar],
     zones: Sequence[ZoneEvent],
+    calendar: Optional[SessionCalendarArtifact] = None,
 ) -> Tuple[SealedAvailabilityGroup, ...]:
     buckets = {}  # type: Dict[datetime, Tuple[List[CompletedBarObservation], List[ZoneEvent]]]
 
@@ -431,6 +450,7 @@ def _availability_groups(
             tuple(buckets[available_at][0]),
             tuple(buckets[available_at][1]),
             sealed_through=available_at,
+            calendar=calendar,
         )
         for available_at in sorted(buckets)
     )
@@ -550,13 +570,11 @@ class DiagnosticReplayResult:
             raise DiagnosticReplayDataError("replay result cannot contain empty bar streams")
         expected_pre_roll = diagnostic_pre_roll_m15_bars(self.policy_bundle)
         expected_minimum = diagnostic_minimum_input_m15_bars(self.policy_bundle)
-        expected_boundary = (
-            self.m15_bars[0].start_time + expected_pre_roll * M15_DURATION
-        )
         if len(self.m15_bars) < expected_minimum:
             raise DiagnosticReplayDataError(
                 "replay result has no complete-hour post-pre-roll decision"
             )
+        expected_boundary = self.m15_bars[expected_pre_roll].start_time
         pre_roll_decisions = tuple(
             decision
             for decision in self.decisions
@@ -576,8 +594,17 @@ class DiagnosticReplayResult:
             post_pre_roll_decision_count=len(post_pre_roll_decisions),
         ):
             raise ValueError("readiness metadata conflicts with replay history boundary")
-        if tuple(aggregate_m15_to_h1(self.m15_bars)) != self.h1_bars:
+        _validate_m15_bars(self.m15_bars, self.calendar)
+        if tuple(aggregate_m15_to_h1(self.m15_bars, calendar=self.calendar)) != self.h1_bars:
             raise ValueError("H1 bars conflict with the exact M15 aggregation")
+        if self.lifecycle.book.policy.calendar != self.calendar:
+            raise ValueError("lifecycle calendar conflicts with replay policy")
+        if any(group.calendar != self.calendar for group in self.availability_groups):
+            raise ValueError("availability group calendar conflicts with replay policy")
+        if any(zone.calendar != self.calendar for zone in self.zones):
+            raise ValueError("zone calendar conflicts with replay policy")
+        if any(decision.calendar != self.calendar for decision in self.decisions):
+            raise ValueError("decision calendar conflicts with replay policy")
         provenance_events = (
             self.m15_bars
             + self.h1_bars
@@ -812,6 +839,20 @@ class DiagnosticReplayResult:
                 raise ValueError("result contains evidence after as_of")
 
     @property
+    def calendar(self) -> Optional[SessionCalendarArtifact]:
+        return self.policy_bundle.calendar
+
+    @property
+    def engine_version(self) -> str:
+        return (DIAGNOSTIC_REPLAY_ENGINE_VERSION if self.calendar is None
+                else SESSION_DIAGNOSTIC_REPLAY_ENGINE_VERSION)
+
+    @property
+    def schema_version(self) -> int:
+        return (DIAGNOSTIC_REPLAY_SCHEMA_VERSION if self.calendar is None
+                else SESSION_DIAGNOSTIC_REPLAY_SCHEMA_VERSION)
+
+    @property
     def policy_bundle_fingerprint(self) -> str:
         return self.policy_bundle.fingerprint
 
@@ -866,10 +907,10 @@ class DiagnosticReplayResult:
         return ";".join(
             (
                 "diagnostic_replay_engine={}".format(
-                    DIAGNOSTIC_REPLAY_ENGINE_VERSION
+                    self.engine_version
                 ),
                 "diagnostic_replay_schema={}".format(
-                    DIAGNOSTIC_REPLAY_SCHEMA_VERSION
+                    self.schema_version
                 ),
                 "dataset={}".format(self.dataset_fingerprint),
                 "input_bars={}".format(self.input_bars_fingerprint),
@@ -913,12 +954,13 @@ def run_diagnostic_replay(
     if any(not isinstance(bar, QuoteBar) for bar in supplied):
         raise TypeError("M15 input must contain QuoteBar values")
     source = _visible_prefix(supplied, normalized_as_of)
-    basis = _validate_m15_bars(source)
+    calendar = policy_bundle.calendar
+    basis = _validate_m15_bars(source, calendar)
     pre_roll = diagnostic_pre_roll_m15_bars(policy_bundle)
     minimum_input = diagnostic_minimum_input_m15_bars(policy_bundle)
     if len(source) < minimum_input:
         raise DiagnosticReplayDataError(
-            "insufficient history: replay requires at least {} contiguous M15 bars "
+            "insufficient history: replay requires at least {} valid M15 bars "
             "({} pre-roll plus a complete-hour post-pre-roll bar); got {}".format(
                 minimum_input,
                 pre_roll,
@@ -928,8 +970,8 @@ def run_diagnostic_replay(
 
     # The H1 builder is intentionally strict: no trailing M15 bars are silently
     # discarded.  Point-in-time callers choose an ``as_of`` hour boundary.
-    h1_bars = aggregate_m15_to_h1(source)
-    pivots = confirmed_h1_pivots(h1_bars, as_of=normalized_as_of)
+    h1_bars = aggregate_m15_to_h1(source, calendar=calendar)
+    pivots = confirmed_h1_pivots(h1_bars, as_of=normalized_as_of, calendar=calendar)
     regimes = h1_regime_events(
         pivots,
         policy=policy_bundle.regime_policy,
@@ -940,6 +982,7 @@ def run_diagnostic_replay(
         period=policy_bundle.impulse_policy.atr_period,
         method=policy_bundle.impulse_policy.atr_method,
         as_of=normalized_as_of,
+        calendar=calendar,
     )
     impulses = h1_impulse_events(
         h1_bars,
@@ -969,7 +1012,7 @@ def run_diagnostic_replay(
         as_of=normalized_as_of,
     )
 
-    groups = _availability_groups(source, h1_bars, zones)
+    groups = _availability_groups(source, h1_bars, zones, calendar)
     lifecycle = _fold_lifecycle(
         groups,
         policy_bundle,
@@ -985,7 +1028,7 @@ def run_diagnostic_replay(
         confirmation_policy=policy_bundle.confirmation_policy,
         as_of=normalized_as_of,
     )
-    post_pre_roll_start = source[0].start_time + pre_roll * M15_DURATION
+    post_pre_roll_start = source[pre_roll].start_time
     pre_roll_count = sum(
         decision.m15_bar_start < post_pre_roll_start for decision in decisions
     )
@@ -1047,6 +1090,8 @@ def validate_diagnostic_replay_result(result: DiagnosticReplayResult) -> None:
 __all__ = [
     "DIAGNOSTIC_REPLAY_ENGINE_VERSION",
     "DIAGNOSTIC_REPLAY_SCHEMA_VERSION",
+    "SESSION_DIAGNOSTIC_REPLAY_ENGINE_VERSION",
+    "SESSION_DIAGNOSTIC_REPLAY_SCHEMA_VERSION",
     "DiagnosticReplayDataError",
     "DiagnosticReplayReadiness",
     "DiagnosticReplayResult",

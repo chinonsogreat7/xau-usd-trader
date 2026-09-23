@@ -7,9 +7,13 @@ It contains no data loading, candidate execution, broker, order, fill, sizing,
 account, backtest, or P&L behavior.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 import hashlib
+from typing import Optional
+
+from .session_calendar import SessionCalendarArtifact
+from .session_timing import validate_calendar
 
 from .candidate_signals import (
     CandidatePolicy,
@@ -111,6 +115,13 @@ class ResearchPolicyBundle:
             raise TypeError("confirmation_policy must be a ConfirmationPolicy")
         if not isinstance(self.candidate_policy, CandidatePolicy):
             raise TypeError("candidate_policy must be a CandidatePolicy")
+        calendars = tuple(getattr(policy, "calendar", None) for policy in (
+            self.impulse_policy, self.lifecycle_policy, self.regime_policy,
+            self.confirmation_policy, self.candidate_policy,
+        ))
+        if any(calendar != calendars[0] for calendar in calendars[1:]):
+            raise ValueError("all research policies must bind the same session calendar")
+        validate_calendar(calendars[0])
         if (
             self.candidate_policy.expected_impulse_policy_fingerprint
             != self.impulse_policy.fingerprint
@@ -123,6 +134,10 @@ class ResearchPolicyBundle:
             != self.origin_lookback_bars
         ):
             raise ValueError("candidate policy must bind the bundle origin lookback")
+
+    @property
+    def calendar(self) -> Optional[SessionCalendarArtifact]:
+        return getattr(self.impulse_policy, "calendar", None)
 
     @property
     def canonical_identity(self) -> str:
@@ -222,9 +237,38 @@ def provisional_diagnostic_baseline_v1() -> ResearchPolicyBundle:
     )
 
 
+def provisional_session_diagnostic_baseline_v1(
+    calendar: SessionCalendarArtifact,
+) -> ResearchPolicyBundle:
+    """Bind the unapproved closure interpretation to one exact finite calendar.
+
+    Indicator/formation windows count traded bars, zones and active retests
+    persist, confirmation expiry counts elapsed M15 intervals, and entries
+    at closures or beyond calendar coverage are cancelled, never queued.
+    """
+    validate_calendar(calendar)
+    if calendar is None:
+        raise TypeError("session baseline requires a calendar")
+    baseline = provisional_diagnostic_baseline_v1()
+    impulse = replace(baseline.impulse_policy, calendar=calendar)
+    return replace(
+        baseline,
+        baseline_id="xauusd-supply-demand-session-provisional",
+        impulse_policy=impulse,
+        lifecycle_policy=replace(baseline.lifecycle_policy, calendar=calendar),
+        regime_policy=replace(baseline.regime_policy, calendar=calendar),
+        confirmation_policy=replace(baseline.confirmation_policy, calendar=calendar),
+        candidate_policy=replace(
+            baseline.candidate_policy, calendar=calendar,
+            expected_impulse_policy_fingerprint=impulse.fingerprint,
+        ),
+    )
+
+
 __all__ = [
     "BaselineStatus",
     "OPERATOR_DOCUMENT_SHA256",
     "ResearchPolicyBundle",
     "provisional_diagnostic_baseline_v1",
+    "provisional_session_diagnostic_baseline_v1",
 ]

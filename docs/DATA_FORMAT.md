@@ -48,7 +48,10 @@ are returned inside an account/instrument-attested envelope rather than as backt
 ## Dataset sidecar manifest v1
 
 Every admitted M15 dataset requires a JSON sidecar accepted by the strict
-`xau_trader.dataset_manifest` v1 validator. The schema is closed: every field below is required and
+`xau_trader.dataset_manifest` validator. Version 1 remains the contract for strict
+`replay-diagnostic` and `check-replay-data`; version 2, described below, binds a calendar for
+`replay-session-features` and `replay-session-diagnostic` across scheduled closures. Both schemas
+are closed: every field below is required and
 unknown fields are rejected, including unknown fields in nested objects. `known_gaps` may be an
 explicitly empty array; `request_parameters` must contain at least one non-empty string key/value
 pair.
@@ -160,22 +163,123 @@ For `synthetic` and `historical_close_assumption`, every loaded bar must have
 `available_at=timestamp`. `observed_receipt` may be later than the bar end, but the manifest's
 retrieval time cannot precede any recorded receipt time.
 
-A manifest with truthful declared gaps can pass provenance binding, but the current diagnostic
-replay rejects any non-empty `known_gaps` array. Its multi-timeframe kernel still requires strict
-contiguity and has no session-segmentation implementation; a weekend or scheduled closure must not
-be smuggled through as if it were a continuous trading interval.
+A manifest with truthful declared gaps can pass provenance binding, but `replay-diagnostic`
+rejects any non-empty `known_gaps` array. That command retains strict contiguity. The separate
+`replay-session-diagnostic` path described below accepts only exact calendar-declared closures
+under a different provisional policy identity.
 
 The provisional diagnostic bundle also requires at least 100 contiguous M15 bars, beginning and
 ending on complete UTC hours. The first 96 decision rows are retained but labeled `pre_roll`; only
 the later rows enter post-pre-roll action counts. Lifecycle state is explicitly empty at the
 dataset start, so the replay makes no claim about zones formed before the supplied history.
 
-Manifest v1 records a calendar ID and version as claims; it does not yet bind a calendar artifact
-URI and hash. A future replay that trusts scheduled gaps must add that content-addressed calendar
-artifact before relaxing the current no-gap restriction.
+Manifest v1 records a calendar ID and version as claims; it does not bind a calendar artifact
+URI or hash. Its JSON representation and canonical fingerprints are unchanged.
 
-The raw-response audit and credentialed export remain unimplemented and blocked independently of
-the offline sidecar validator.
+## Dataset sidecar manifest v2 and explicit calendars
+
+Version 2 preserves every v1 field and validation rule except for `version: 2` and this expanded
+required object:
+
+```text
+session_calendar { id, version, artifact_uri, artifact_sha256, content_fingerprint }
+```
+
+`artifact_uri` is non-empty redacted metadata, without URL credentials, query strings, fragments,
+authorization values, or control characters. It is never fetched by the CLI. Both hashes must be
+exactly 64 lowercase hexadecimal characters: `artifact_sha256` identifies the calendar file's raw
+bytes, while `content_fingerprint` identifies its canonical parsed JSON. Reformatting a calendar
+file can change the first hash without changing the second. All three extra fields are required
+in v2 and forbidden in v1; partial references and unknown fields are rejected.
+
+The local calendar file has its own closed `xau_trader.session_calendar` schema, version 1:
+
+```text
+schema, version, id, revision
+provider_name, provider_legal_entity, instrument, product_form
+coverage_start, coverage_end, source_reference, retrieved_at
+closures[] { start, end, reason }
+```
+
+Calendar coverage is finite. Closure intervals are explicitly supplied in UTC, half-open, ordered,
+nonoverlapping, nonadjacent, and wholly inside that coverage. An empty `closures` array explicitly
+declares no closures in the covered period. No weekends, holidays, daylight-saving changes, or
+provider schedule are inferred. `source_reference` records the redacted evidence source.
+
+Calendar binding checks both hashes, exact calendar ID/revision, provider name/legal entity,
+instrument, and product form. Calendar coverage must contain the dataset's entire coverage, and
+calendar retrieval must be no later than dataset retrieval. A schedule may have been published
+before the period it covers; no requirement makes its retrieval follow its coverage end.
+This binding does not prove historical calendar knowledge: replay `as_of` gates market evidence,
+not calendar retrieval. The supplied schedule is assumed known, with that limitation explicitly
+recorded in session semantics.
+
+Both session replay commands additionally require every closure to begin and end on whole UTC hours.
+Every gap between bars must match an explicit closure exactly; bars inside closures and missing
+bars during open intervals fail. Dataset `known_gaps` must still match the observed gaps exactly.
+Each command forms H1 only from four actual M15 bars within one UTC hour; partial hours remain
+unsupported. It retains real timestamps and feature history across closures without synthetic
+gap fills. See [SESSION_FEATURE_REPLAY.md](SESSION_FEATURE_REPLAY.md) for command usage and output.
+
+`replay-session-diagnostic` adds the full offline paper-candidate ledger using a separately
+fingerprinted, calendar-bound provisional policy. It requires at least 100 actual M15 bars in
+complete UTC hours and labels the first 96 actual bars as pre-roll, retaining history across
+declared closures. Its JSON records the complete calendar and session semantics, and its
+decision CSV adds calendar-fingerprint and session-semantics columns. Export revalidates the
+result by exact recomputation. Both `--trace-json` and `--decisions-csv` are required new paths;
+there is no overwrite option. See [SESSION_DIAGNOSTIC_REPLAY.md](SESSION_DIAGNOSTIC_REPLAY.md).
+
+A successful feature trace alone does not establish strategy readiness. The feature-only command
+does not generate candidates, while a successful session diagnostic trace is research evidence,
+not strategy approval, an execution result, or a profit claim. `replay-diagnostic` and
+`check-replay-data` still reject v2 and retain their strict v1 requirements.
+
+## Offline MT5 complete-quote tick import
+
+The separate `import-mt5-ticks` command converts a narrowly supported local tick export into this
+normalized M15 schema and manifest v2. It requires the exact six ordered headers
+`<DATE>,<TIME>,<BID>,<ASK>,<LAST>,<VOLUME>`, optionally followed by `<FLAGS>`, using comma or tab
+separators. UTF-8 and BOM-marked UTF-16 are accepted. Dates use `YYYY.MM.DD`, with `HH:MM:SS`
+times and optional milliseconds. Every row must carry positive finite bid and ask values;
+blank/zero quote sides and ordinary OHLC exports are rejected rather than repaired.
+
+A required import plan records exact raw/calendar identities, redacted provenance and rights,
+explicit whole-hour UTC coverage, and a single verified fixed offset for the source timestamps.
+The importer does not infer broker symbol meaning, DST transitions, calendars, or data permission.
+All ticks must lie inside the selected half-open coverage. Equal-time ticks retain file order;
+ticks on a quarter-hour boundary enter the next bucket. Every open M15 bucket must contain a
+quote, and skipped intervals must match whole-hour calendar closures exactly. No closed-hour
+bars or missing quote sides are synthesized.
+
+Bid/ask OHLC are independently calculated from the supplied quote pairs. Bar `volume` remains
+unspecified. User exports receive `historical_close_assumption`, not `observed_receipt`;
+synthetic-generation fixtures remain `synthetic`. The report includes per-bar tick counts,
+first/last observed tick times, and silence diagnostics. A first observed quote after the nominal
+bar start is not evidence of an executable next-open price. Even one tick per open bucket passes
+structural aggregation, so neither import success nor a bound manifest establishes complete
+tick history or P&L validity.
+
+The command requires new, distinct CSV, manifest, and report paths, preserves the source export,
+and never fetches metadata URIs. It does not replay decisions or create an order. See
+[MT5_DATA_IMPORT.md](MT5_DATA_IMPORT.md) for acquisition steps, the import plan, command, and
+limitations. Pass the original tick export as `--raw-data` when separately replaying its
+normalized output.
+
+## Input inspection and remaining acquisition work
+
+Broker-connected raw-response acquisition and credentialed export remain unimplemented and
+blocked independently of the offline sidecar validator and local MT5 tick importer.
+
+`check-replay-data` inspects a normalized CSV against the current policy's temporal requirements
+without running replay. It reports gaps and contiguous complete-hour segment lengths. Supplying
+`--manifest` (and `--raw-data` where applicable) also validates input hashes and provenance binding.
+Only manifest v1 is accepted by this strategy preflight command.
+Missing manifests and temporal incompatibilities return status code `1`; invalid data, arguments,
+or manifest bindings return `2`. Valid input binding and technical compatibility return `0`.
+The command does not verify data-use permissions or classify gaps as scheduled closures. The
+[data intake checkpoint](DATA_INTAKE.md) explains why daily gold breaks can leave each session
+shorter than the strict replay's minimum history requirement and how the separate session path
+retains actual-bar history across documented closures.
 
 `validate-data` performs structural validation and reports cadence gaps against an expected
 interval. It deliberately labels the result `structurally_valid`, not strategy-ready: weekend and holiday

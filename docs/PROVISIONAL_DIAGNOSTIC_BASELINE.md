@@ -79,7 +79,7 @@ or broker instruction.
 ## Replay boundary
 
 `replay-diagnostic` is the first complete consumer of this bundle. It accepts only a gap-free,
-whole-hour M15 bid/ask CSV whose strict sidecar manifest binds the exact raw and normalized hashes.
+whole-hour M15 bid/ask CSV whose strict v1 sidecar manifest binds the exact raw and normalized hashes.
 The replay derives H1 bars, ATR, pivots, regime, impulses, zones, lifecycle transitions, M15 EMA and
 candle evidence, confirmations, and one paper candidate decision per M15 bar. Early warm-up bars
 remain explicit `NO_TRADE` records rather than being discarded.
@@ -95,6 +95,47 @@ Its JSON and CSV outputs are diagnostic evidence artifacts. A `BUY` or `SELL` ro
 is a next-open research candidate—not a submitted or simulated order—and contains no quantity,
 fill, position, stop, target, P&L, or claim that the strategy makes money.
 
+The separate `replay-session-features` command uses this bundle's ATR(14) and EMA(8) policies with
+a v2 dataset manifest and an explicit finite calendar. It computes only H1 bars, ATR, confirmed H1
+pivots, and M15 EMA across exact declared whole-hour closures, preserving actual timestamps and
+history. A two-session synthetic fixture (184 M15 bars, one one-hour closure) yields 46 H1 bars,
+177 EMA events, and 33 ATR events. That feature-only command does not generate zones, lifecycle,
+confirmations, or candidates and does not assess full strategy readiness. `check-replay-data`
+remains a strict v1 strategy preflight. See [SESSION_FEATURE_REPLAY.md](SESSION_FEATURE_REPLAY.md).
+
+## Separately versioned session diagnostic baseline
+
+`provisional_session_diagnostic_baseline_v1(calendar)` retains the selections above but binds
+every relevant policy to one finite calendar and the `xauusd-session-strategy-v1` semantics.
+Its baseline ID is `xauusd-supply-demand-session-provisional`; it remains unapproved. The original
+strict bundle and its canonical identity are unchanged. Results from the two bundles must not
+be pooled as if their timing semantics were identical.
+
+| Closure-sensitive area | Provisional session selection |
+| --- | --- |
+| Supported calendar | Explicit, dataset-bound closures with whole UTC-hour endpoints only |
+| Indicator/formation history | Actual open bars; no invented candles, timestamp compression, or seed reset |
+| H1 impulse and origin lookback | Four actual H1 bars and up to 20 prior actual H1 bars, respectively |
+| Pivot confirmation | Three actual right-wing H1 bars, available only after all dependencies |
+| Zones | Preserve across the closure; invalidate only on the applicable observed H1 close |
+| Active retest episode | Preserve across the closure; end on the next observed price exit or invalidation |
+| Confirmation lifetime | Elapsed M15 intervals, including closed time; the two-interval lifetime does not pause |
+| Entry at a closure | Explicit `NO_TRADE`; do not queue an entry for reopening |
+| Entry beyond finite calendar evidence | Explicit `NO_TRADE`; require a fully covered next M15 interval |
+| Warm-up | First 96 actual M15 bars are pre-roll, even when a closure intervenes |
+
+`replay-session-diagnostic` consumes manifest v2 plus the bound calendar and emits the full offline
+event trace and one decision row per M15 bar. Both output paths are required and must not already
+exist. The JSON embeds calendar/session metadata, the CSV adds calendar/semantics provenance,
+and export verifies the stored result against exact replay recomputation.
+Market evidence is gated point-in-time, but calendar retrieval is not gated by `as_of`.
+Session semantics explicitly record that the supplied schedule is assumed known rather than
+verified as historically available.
+
+The current synthetic two-session fixture yields 12 zones, 4 confirmations, and 184 decisions
+(96 pre-roll, 88 post-pre-roll). This is an implementation regression, not strategy performance
+or a verified Exness sample. See [SESSION_DIAGNOSTIC_REPLAY.md](SESSION_DIAGNOSTIC_REPLAY.md).
+
 ## Gates before P&L simulation
 
 The following remain unresolved and prevent honest performance claims:
@@ -107,6 +148,10 @@ The following remain unresolved and prevent honest performance claims:
 - fixed-fractional sizing and account-wide daily/weekly risk transitions; and
 - a frozen walk-forward manifest with untouched holdouts and predeclared pass/fail thresholds.
 
-The next safe validation step is to replay a small licensed M15 sample (with H1 derived by the
-kernel), manually reconcile the event trace, and record mismatches before building the separate
-event-driven P&L simulator.
+The next validation step is to inspect an authorized M15 sample and verify its calendar and
+provenance. `check-replay-data` reports strict strategy compatibility; for feeds with closures,
+the implemented session diagnostic path allows full event-trace reconciliation with manifest v2
+and the separately versioned calendar-bound policy. Manually reconcile its zone, lifecycle,
+confirmation-expiry, and candidate-timing behavior before building the separate event-driven P&L
+simulator. No real dataset or Exness schedule has been verified, and no demo trades have been
+sent by this implementation. See [the data intake checkpoint](DATA_INTAKE.md).
